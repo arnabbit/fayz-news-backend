@@ -11,19 +11,16 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-const CATEGORIES = [
-  { name: 'Home', slug: 'home' },
-  { name: 'Politics', slug: 'politics' },
-  { name: 'World', slug: 'world' },
-  { name: 'Sports', slug: 'sports' },
-  { name: 'Economy', slug: 'economy' },
-  { name: 'Technology', slug: 'technology' },
-  { name: 'Entertainment', slug: 'entertainment' },
-  { name: 'Science', slug: 'science' },
-  { name: 'Health', slug: 'health' },
-  { name: 'Legal', slug: 'legal' },
-  { name: 'Environment', slug: 'environment' },
+// Canonical order for display
+const CATEGORY_ORDER = [
+  'home', 'politics', 'world', 'sports', 'economy',
+  'technology', 'entertainment', 'science', 'health', 'legal', 'environment',
 ];
+const CATEGORY_NAMES = {
+  home: 'Home', politics: 'Politics', world: 'World', sports: 'Sports',
+  economy: 'Economy', technology: 'Technology', entertainment: 'Entertainment',
+  science: 'Science', health: 'Health', legal: 'Legal', environment: 'Environment',
+};
 
 let db;
 
@@ -35,6 +32,14 @@ async function connectDB() {
   await db.collection('articles').createIndex({ published_date: -1 });
   await db.collection('articles').createIndex({ category: 1 });
   console.log('Connected to MongoDB');
+}
+
+async function latestDateKey() {
+  const doc = await db.collection('articles').findOne(
+    {},
+    { sort: { _createdAt: -1 }, projection: { _dateKey: 1 } }
+  );
+  return doc ? doc._dateKey : null;
 }
 
 function todayStr() {
@@ -81,9 +86,23 @@ app.post('/api/articles', async (req, res) => {
   }
 });
 
-// ---- GET /api/categories ----
-app.get('/api/categories', (req, res) => {
-  res.json({ categories: CATEGORIES });
+// ---- GET /api/categories — only categories present in the latest date's articles ----
+app.get('/api/categories', async (req, res) => {
+  try {
+    const dateKey = await latestDateKey();
+    if (!dateKey) {
+      return res.json({ categories: [] });
+    }
+    const slugs = await db.collection('articles').distinct('category', { _dateKey: dateKey });
+    // Normalise to slugs, deduplicate, sort by canonical order
+    const found = new Set(slugs.map(s => s.toLowerCase()));
+    const ordered = CATEGORY_ORDER.filter(slug => slug === 'home' || found.has(slug));
+    const categories = ordered.map(slug => ({ name: CATEGORY_NAMES[slug] || slug, slug }));
+    res.json({ categories });
+  } catch (err) {
+    console.error('GET /api/categories error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---- GET /api/articles?page=1&per_page=10&category=politics ----
@@ -93,10 +112,15 @@ app.get('/api/articles', async (req, res) => {
     const perPage = Math.min(50, Math.max(1, parseInt(req.query.per_page) || 10));
     const category = (req.query.category || '').toLowerCase();
 
+    // Always scope to latest date only
+    const dateKey = await latestDateKey();
+    if (!dateKey) {
+      return res.json({ articles: [], pagination: { page, per_page: perPage, total: 0, has_next: false, next_page: null } });
+    }
+
     // Build filter
-    const filter = {};
+    const filter = { _dateKey: dateKey };
     if (category && category !== 'home') {
-      // Match category case-insensitively
       filter.category = { $regex: new RegExp(`^${category}$`, 'i') };
     }
 
