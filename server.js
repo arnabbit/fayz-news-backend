@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
 const app = express();
 app.use(cors());
@@ -31,6 +31,8 @@ async function connectDB() {
   // Index for fast queries
   await db.collection('articles').createIndex({ published_date: -1 });
   await db.collection('articles').createIndex({ category: 1 });
+  await db.collection('articles').createIndex({ _dateKey: 1, _id: -1 });
+  await db.collection('articles').createIndex({ _dateKey: 1, category: 1, _id: -1 });
   console.log('Connected to MongoDB');
 }
 
@@ -111,11 +113,22 @@ app.get('/api/articles', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const perPage = Math.min(50, Math.max(1, parseInt(req.query.per_page) || 10));
     const category = (req.query.category || '').toLowerCase();
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
 
     // Always scope to latest date only
     const dateKey = await latestDateKey();
     if (!dateKey) {
-      return res.json({ articles: [], pagination: { page, per_page: perPage, total: 0, has_next: false, next_page: null } });
+      return res.json({
+        articles: [],
+        pagination: {
+          page,
+          per_page: perPage,
+          total: 0,
+          has_next: false,
+          next_page: null,
+          next_cursor: null,
+        },
+      });
     }
 
     // Build filter
@@ -125,25 +138,49 @@ app.get('/api/articles', async (req, res) => {
     }
 
     const total = await db.collection('articles').countDocuments(filter);
-    const skip = (page - 1) * perPage;
 
-    const docs = await db.collection('articles')
-      .find(filter, { projection: { _id: 0, _dateKey: 0, _createdAt: 0 } })
-      .sort({ _createdAt: -1 })
-      .skip(skip)
-      .limit(perPage)
+    // Cursor mode: faster and stable. Fallback to page/skip for old clients.
+    const query = { ...filter };
+    let usedPage = page;
+    if (cursor) {
+      if (!ObjectId.isValid(cursor)) {
+        return res.status(400).json({ error: 'Invalid cursor' });
+      }
+      query._id = { $lt: new ObjectId(cursor) };
+      usedPage = 1;
+    } else if (page > 1) {
+      const skip = (page - 1) * perPage;
+      const pivot = await db.collection('articles')
+        .find(filter, { projection: { _id: 1 } })
+        .sort({ _id: -1 })
+        .skip(skip - 1)
+        .limit(1)
+        .toArray();
+      if (pivot.length > 0) {
+        query._id = { $lt: pivot[0]._id };
+      }
+    }
+
+    const rows = await db.collection('articles')
+      .find(query)
+      .sort({ _id: -1 })
+      .limit(perPage + 1)
       .toArray();
 
-    const hasNext = skip + perPage < total;
+    const hasNext = rows.length > perPage;
+    const docs = rows.slice(0, perPage);
+    const nextCursor = hasNext ? String(docs[docs.length - 1]._id) : null;
+    const cleanedDocs = docs.map(({ _id, _dateKey, _createdAt, ...rest }) => rest);
 
     res.json({
-      articles: docs,
+      articles: cleanedDocs,
       pagination: {
-        page,
+        page: usedPage,
         per_page: perPage,
         total,
         has_next: hasNext,
-        next_page: hasNext ? page + 1 : null
+        next_page: hasNext ? usedPage + 1 : null,
+        next_cursor: nextCursor,
       }
     });
   } catch (err) {
