@@ -54,6 +54,31 @@ function todayISO() {
   return new Date().toISOString().split('T')[0]; // YYYY-MM-DD for dedup
 }
 
+function cleanStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => String(item || '').trim()).filter(Boolean);
+}
+
+function cleanDevelopments(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => ({
+    summary: String(item?.summary || '').trim(),
+    sourcePostUrls: cleanStringArray(item?.sourcePostUrls)
+  })).filter(item => item.summary);
+}
+
+function cleanSourcePosts(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => ({
+    postUrl: String(item?.postUrl || '').trim(),
+    postNumber: Number.isFinite(Number(item?.postNumber)) ? Number(item.postNumber) : null,
+    sourceHeadline: String(item?.sourceHeadline || '').trim(),
+    mediaTypes: cleanStringArray(item?.mediaTypes),
+    captureMethods: cleanStringArray(item?.captureMethods),
+    slideCount: Number.isFinite(Number(item?.slideCount)) ? Number(item.slideCount) : 0
+  })).filter(item => item.postUrl || item.sourceHeadline);
+}
+
 // ---- POST /api/articles — extension pushes articles here ----
 app.post('/api/articles', async (req, res) => {
   try {
@@ -75,6 +100,8 @@ app.post('/api/articles', async (req, res) => {
       published_date: date,
       category: a.category || 'World',
       body: Array.isArray(a.body) ? a.body : [String(a.body || '')],
+      developments: cleanDevelopments(a.developments),
+      sourcePosts: cleanSourcePosts(a.sourcePosts),
       _dateKey: dateKey,
       _createdAt: new Date()
     }));
