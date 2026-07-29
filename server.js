@@ -63,7 +63,10 @@ function cleanDevelopments(value) {
   if (!Array.isArray(value)) return [];
   return value.map(item => ({
     summary: String(item?.summary || '').trim(),
-    sourcePostUrls: cleanStringArray(item?.sourcePostUrls)
+    sourcePostUrls: cleanStringArray(item?.sourcePostUrls),
+    sourcePostNumbers: Array.isArray(item?.sourcePostNumbers)
+      ? item.sourcePostNumbers.map(Number).filter(Number.isFinite)
+      : []
   })).filter(item => item.summary);
 }
 
@@ -72,6 +75,8 @@ function cleanSourcePosts(value) {
   return value.map(item => ({
     postUrl: String(item?.postUrl || '').trim(),
     postNumber: Number.isFinite(Number(item?.postNumber)) ? Number(item.postNumber) : null,
+    feedOrder: Number.isFinite(Number(item?.feedOrder)) ? Number(item.feedOrder) : null,
+    feedOrderMeaning: String(item?.feedOrderMeaning || '').trim(),
     sourceHeadline: String(item?.sourceHeadline || '').trim(),
     mediaTypes: cleanStringArray(item?.mediaTypes),
     captureMethods: cleanStringArray(item?.captureMethods),
