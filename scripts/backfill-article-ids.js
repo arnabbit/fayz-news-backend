@@ -6,15 +6,16 @@
  *   node scripts/backfill-article-ids.js            # dry run, writes nothing
  *   node scripts/backfill-article-ids.js --apply    # write the new ids
  *
- * Dry run reports: document count, how many ids change, and every collision
- * (two or more documents computing the same id). Collisions are duplicate
- * stories; --apply refuses to run while any exist unless --allow-collisions is
- * passed, in which case the oldest document of each colliding group keeps the
- * computed id and the rest are left untouched and listed for manual review.
+ * A base id can be claimed by more than one story, because a single roundup
+ * reel yields several unrelated articles on the same day. The oldest document
+ * of such a group keeps the base id; the rest get a headline-qualified id, the
+ * same rule POST /api/articles applies. Only documents that are byte-identical
+ * stories (same base id AND same normalized headline) are a true duplicate, and
+ * --apply refuses to run if any exist unless --allow-collisions is passed.
  */
 require('dotenv').config(); // run from the repo root, same as server.js
 const { MongoClient } = require('mongodb');
-const { computeArticleId } = require('../articleId');
+const { computeArticleId, qualifyArticleId, normalizeHeadline } = require('../articleId');
 
 const APPLY = process.argv.includes('--apply');
 const ALLOW_COLLISIONS = process.argv.includes('--allow-collisions');
@@ -36,31 +37,58 @@ async function main() {
     .sort({ _createdAt: 1, _id: 1 })
     .toArray();
 
-  const groups = new Map(); // newId -> [doc, ...] in oldest-first order
-  let unchanged = 0;
+  const baseGroups = new Map(); // baseId -> [doc, ...] in oldest-first order
   let noSourcePosts = 0;
 
   for (const doc of docs) {
-    const newId = computeArticleId(doc, doc._dateKey);
+    const baseId = computeArticleId(doc, doc._dateKey);
     if (!Array.isArray(doc.sourcePosts) || doc.sourcePosts.length === 0) noSourcePosts++;
-    if (doc.id === newId) unchanged++;
-    if (!groups.has(newId)) groups.set(newId, []);
-    groups.get(newId).push(doc);
+    if (!baseGroups.has(baseId)) baseGroups.set(baseId, []);
+    baseGroups.get(baseId).push(doc);
   }
 
-  const collisions = Array.from(groups.entries()).filter(([, list]) => list.length > 1);
+  // Assign final ids: oldest story on a base id keeps it, later distinct
+  // stories are headline-qualified. Same base id + same headline is a real
+  // duplicate and is reported rather than silently split.
+  const assignment = new Map(); // doc._id -> finalId
+  const trueDuplicates = [];
+  const qualified = [];
+  let unchanged = 0;
 
-  console.log(`distinct computed ids: ${groups.size}`);
-  console.log(`ids already correct:   ${unchanged}`);
-  console.log(`fallback (no sourcePosts): ${noSourcePosts}`);
-  console.log(`collisions: ${collisions.length}`);
-
-  for (const [newId, list] of collisions) {
-    console.log(`  ${newId} <- ${list.length} docs:`);
-    for (const d of list) {
-      console.log(`     _id=${d._id} date=${d._dateKey} headline=${JSON.stringify(d.headline)}`);
+  for (const [baseId, list] of baseGroups.entries()) {
+    const owners = new Map(); // normalized headline -> finalId
+    for (const doc of list) {
+      const headline = normalizeHeadline(doc.headline);
+      let finalId;
+      if (owners.has(headline)) {
+        finalId = owners.get(headline);
+        trueDuplicates.push({ doc, finalId });
+      } else if (owners.size === 0) {
+        finalId = baseId;
+        owners.set(headline, finalId);
+      } else {
+        finalId = qualifyArticleId(baseId, doc.headline);
+        owners.set(headline, finalId);
+        qualified.push({ doc, baseId, finalId });
+      }
+      assignment.set(String(doc._id), finalId);
+      if (doc.id === finalId) unchanged++;
     }
   }
+
+  console.log(`distinct base ids: ${baseGroups.size}`);
+  console.log(`ids already correct:   ${unchanged}`);
+  console.log(`fallback (no sourcePosts): ${noSourcePosts}`);
+  console.log(`headline-qualified (shared base id, distinct story): ${qualified.length}`);
+  console.log(`true duplicates (same base id AND headline): ${trueDuplicates.length}`);
+
+  for (const q of qualified) {
+    console.log(`  base ${q.baseId} -> ${q.finalId}  _id=${q.doc._id} date=${q.doc._dateKey} ${JSON.stringify(q.doc.headline)}`);
+  }
+  for (const t of trueDuplicates) {
+    console.log(`  DUP ${t.finalId}  _id=${t.doc._id} date=${t.doc._dateKey} ${JSON.stringify(t.doc.headline)}`);
+  }
+  const collisions = trueDuplicates;
 
   if (!APPLY) {
     console.log('\ndry run: nothing written. Re-run with --apply to write.');
@@ -69,20 +97,24 @@ async function main() {
   }
 
   if (collisions.length > 0 && !ALLOW_COLLISIONS) {
-    console.error('\nrefusing to apply: collisions present. Resolve them, or pass --allow-collisions.');
+    console.error('\nrefusing to apply: true duplicates present. Resolve them, or pass --allow-collisions.');
     await client.close();
     process.exitCode = 1;
     return;
   }
 
+  // True duplicates keep their current id — nothing is merged or deleted; they
+  // are listed above for manual review.
+  const dupIds = new Set(trueDuplicates.map(t => String(t.doc._id)));
   const ops = [];
   const skipped = [];
-  for (const [newId, list] of groups.entries()) {
-    const [keeper, ...rest] = list;
-    if (keeper.id !== newId) {
-      ops.push({ updateOne: { filter: { _id: keeper._id }, update: { $set: { id: newId } } } });
+  for (const doc of docs) {
+    const key = String(doc._id);
+    if (dupIds.has(key)) { skipped.push(doc); continue; }
+    const finalId = assignment.get(key);
+    if (doc.id !== finalId) {
+      ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: { id: finalId } } } });
     }
-    for (const dup of rest) skipped.push({ _id: dup._id, wouldBe: newId, id: dup.id });
   }
 
   if (ops.length > 0) {
@@ -93,7 +125,7 @@ async function main() {
   }
 
   if (skipped.length > 0) {
-    console.log(`left untouched (colliding duplicates, review manually): ${skipped.length}`);
+    console.log(`left untouched (true duplicates, review manually): ${skipped.length}`);
     for (const s of skipped) console.log(`  _id=${s._id} keeps id=${s.id}`);
   }
 

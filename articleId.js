@@ -47,19 +47,33 @@ function sha16(input) {
 }
 
 // Content-derived, stable article id.
-//   primary:  sha256(sorted, unique, canonical sourcePosts[].postUrl keys)
+//   primary:  sha256(sorted unique canonical post keys + '|' + dateKey)
 //   fallback: sha256(normalizedHeadline + '|' + dateKey)   when no source posts
+//
+// dateKey is part of the key because the same post is re-summarised on later
+// days: without it, day 2's version of a story overwrites day 1's and vanishes
+// from the edition readers are served.
 function computeArticleId(article, dateKey) {
   const keys = Array.isArray(article && article.sourcePosts)
     ? article.sourcePosts.map(p => canonicalPostKey(p && p.postUrl)).filter(Boolean)
     : [];
 
+  const day = String(dateKey || '');
   if (keys.length > 0) {
     const unique = Array.from(new Set(keys)).sort();
-    return sha16(unique.join('\n'));
+    return sha16(`${unique.join('\n')}|${day}`);
   }
 
-  return sha16(`${normalizeHeadline(article && article.headline)}|${String(dateKey || '')}`);
+  return sha16(`${normalizeHeadline(article && article.headline)}|${day}`);
+}
+
+// A single roundup reel routinely yields several unrelated stories on the same
+// day, so one post set is not one story. When two distinct stories land on the
+// same base id, every one after the first is qualified by its headline instead
+// of silently overwriting. Deterministic, so a retried payload re-derives the
+// identical ids.
+function qualifyArticleId(baseId, headline) {
+  return sha16(`${baseId}|${normalizeHeadline(headline)}`);
 }
 
 module.exports = {
@@ -68,4 +82,5 @@ module.exports = {
   canonicalPostKey,
   normalizeHeadline,
   computeArticleId,
+  qualifyArticleId,
 };

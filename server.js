@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
-const { computeArticleId } = require('./articleId');
+const { computeArticleId, qualifyArticleId, normalizeHeadline } = require('./articleId');
 
 const app = express();
 app.use(cors());
@@ -118,10 +118,37 @@ app.post('/api/articles', async (req, res) => {
       };
     });
 
-    // Two articles in one payload can collapse to the same id; last one wins.
-    const byId = new Map();
-    for (const doc of docs) byId.set(doc.id, doc);
-    const uniqueDocs = Array.from(byId.values());
+    // Several stories can share a base id (one roundup reel, many stories).
+    // Never let that silently drop or overwrite one: the first story to claim a
+    // base id keeps it, any other story on that id gets a headline-qualified id.
+    // Sorting by headline keeps the assignment independent of payload order, so
+    // a retried payload re-derives exactly the same ids.
+    const existing = await db.collection('articles')
+      .find({ id: { $in: docs.map(d => d.id) } }, { projection: { id: 1, headline: 1 } })
+      .toArray();
+    const claimedBy = new Map(existing.map(e => [e.id, normalizeHeadline(e.headline)]));
+
+    // Collapse the same story sent twice in one payload.
+    const byStory = new Map();
+    for (const doc of docs) byStory.set(`${doc.id}|${normalizeHeadline(doc.headline)}`, doc);
+
+    const uniqueDocs = [];
+    const assigned = new Set();
+    const candidates = [...byStory.values()].sort(
+      (a, b) => normalizeHeadline(a.headline).localeCompare(normalizeHeadline(b.headline))
+    );
+    for (const doc of candidates) {
+      const headline = normalizeHeadline(doc.headline);
+      const owner = claimedBy.get(doc.id);
+      if (owner !== undefined && owner !== headline) {
+        doc.id = qualifyArticleId(doc.id, doc.headline);
+      } else {
+        claimedBy.set(doc.id, headline);
+      }
+      if (assigned.has(doc.id)) continue;
+      assigned.add(doc.id);
+      uniqueDocs.push(doc);
+    }
 
     const now = new Date();
     await db.collection('articles').bulkWrite(
