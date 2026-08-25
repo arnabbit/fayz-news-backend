@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const { computeArticleId, qualifyArticleId, normalizeHeadline } = require('./articleId');
+const { editionDateKey, editionDateLabel } = require('./editionDate');
 
 const app = express();
 app.use(cors());
@@ -56,16 +57,6 @@ async function latestDateKey() {
   return doc ? doc._dateKey : null;
 }
 
-function todayStr() {
-  return new Date().toLocaleDateString('en-US', {
-    year: 'numeric', month: 'long', day: 'numeric'
-  }); // e.g. "March 25, 2026"
-}
-
-function todayISO() {
-  return new Date().toISOString().split('T')[0]; // YYYY-MM-DD for dedup
-}
-
 function cleanStringArray(value) {
   if (!Array.isArray(value)) return [];
   return value.map(item => String(item || '').trim()).filter(Boolean);
@@ -99,8 +90,10 @@ app.post('/api/articles', async (req, res) => {
       return res.status(400).json({ error: 'articles array required' });
     }
 
-    const date = todayStr();
-    const dateKey = todayISO();
+    // Both derived in IST (see editionDate.js) — the host is UTC on Render.
+    const now = new Date();
+    const date = editionDateLabel(now);
+    const dateKey = editionDateKey(now);
 
     // Append-only: never delete an existing edition. A same-day second push adds
     // to it. Identity is content-derived, so a re-push of the same story (or a
@@ -150,7 +143,6 @@ app.post('/api/articles', async (req, res) => {
       uniqueDocs.push(doc);
     }
 
-    const now = new Date();
     await db.collection('articles').bulkWrite(
       uniqueDocs.map(doc => ({
         updateOne: {
