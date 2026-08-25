@@ -1,8 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
+const { computeArticleId } = require('./articleId');
 
 const app = express();
 app.use(cors());
@@ -10,6 +10,7 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = process.env.MONGODB_DB || 'fayznews';
 
 // Canonical order for display
 const CATEGORY_ORDER = [
@@ -27,12 +28,23 @@ let db;
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI);
   await client.connect();
-  db = client.db('fayznews');
+  db = client.db(DB_NAME);
   // Index for fast queries
   await db.collection('articles').createIndex({ published_date: -1 });
   await db.collection('articles').createIndex({ category: 1 });
   await db.collection('articles').createIndex({ _dateKey: 1, _id: -1 });
   await db.collection('articles').createIndex({ _dateKey: 1, category: 1, _id: -1 });
+  // Article identity is content-derived; the unique index is the last line of
+  // defence against a duplicate insert racing two concurrent pushes.
+  try {
+    await db.collection('articles').createIndex({ id: 1 }, { unique: true, name: 'id_unique' });
+  } catch (err) {
+    console.error(
+      'WARNING: could not create unique index on `id` — duplicate ids exist. ' +
+      'Run `node scripts/backfill-article-ids.js --apply` then restart.',
+      err.message
+    );
+  }
   console.log('Connected to MongoDB');
 }
 
@@ -90,25 +102,45 @@ app.post('/api/articles', async (req, res) => {
     const date = todayStr();
     const dateKey = todayISO();
 
-    // Remove today's existing articles (upsert behavior)
-    await db.collection('articles').deleteMany({ _dateKey: dateKey });
+    // Append-only: never delete an existing edition. A same-day second push adds
+    // to it. Identity is content-derived, so a re-push of the same story (or a
+    // retry after a post-write 500) updates in place instead of duplicating.
+    const docs = articles.map(a => {
+      const sourcePosts = cleanSourcePosts(a.sourcePosts);
+      const headline = a.headline || 'Untitled';
+      return {
+        id: computeArticleId({ headline, sourcePosts }, dateKey),
+        headline,
+        category: a.category || 'World',
+        body: Array.isArray(a.body) ? a.body : [String(a.body || '')],
+        developments: cleanDevelopments(a.developments),
+        sourcePosts
+      };
+    });
 
-    // Insert all articles with generated IDs
-    const docs = articles.map(a => ({
-      id: crypto.randomBytes(6).toString('hex'),
-      headline: a.headline || 'Untitled',
-      published_date: date,
-      category: a.category || 'World',
-      body: Array.isArray(a.body) ? a.body : [String(a.body || '')],
-      developments: cleanDevelopments(a.developments),
-      sourcePosts: cleanSourcePosts(a.sourcePosts),
-      _dateKey: dateKey,
-      _createdAt: new Date()
-    }));
+    // Two articles in one payload can collapse to the same id; last one wins.
+    const byId = new Map();
+    for (const doc of docs) byId.set(doc.id, doc);
+    const uniqueDocs = Array.from(byId.values());
 
-    await db.collection('articles').insertMany(docs);
+    const now = new Date();
+    await db.collection('articles').bulkWrite(
+      uniqueDocs.map(doc => ({
+        updateOne: {
+          filter: { id: doc.id },
+          update: {
+            $set: { ...doc, _updatedAt: now },
+            // The edition an article first landed in is its edition. A re-push
+            // updates the story, it does not move it to another day.
+            $setOnInsert: { published_date: date, _dateKey: dateKey, _createdAt: now }
+          },
+          upsert: true
+        }
+      })),
+      { ordered: false }
+    );
 
-    res.json({ ok: true, date, count: docs.length });
+    res.json({ ok: true, date, count: uniqueDocs.length });
   } catch (err) {
     console.error('POST /api/articles error:', err);
     res.status(500).json({ error: err.message });
@@ -197,7 +229,7 @@ app.get('/api/articles', async (req, res) => {
     const hasNext = rows.length > perPage;
     const docs = rows.slice(0, perPage);
     const nextCursor = hasNext ? String(docs[docs.length - 1]._id) : null;
-    const cleanedDocs = docs.map(({ _id, _dateKey, _createdAt, ...rest }) => rest);
+    const cleanedDocs = docs.map(({ _id, _dateKey, _createdAt, _updatedAt, ...rest }) => rest);
 
     res.json({
       articles: cleanedDocs,
