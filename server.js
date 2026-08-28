@@ -7,6 +7,7 @@ const { editionDateKey, editionDateLabel } = require('./editionDate');
 const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
+const { pushTokenDocument } = require('./pushTokens');
 
 const app = express();
 app.use(cors());
@@ -520,6 +521,33 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
     res.json({ id: req.params.id, hidden });
   } catch (err) {
     console.error('PATCH /api/v2/articles/:id error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- POST /api/v2/push/tokens — the push registry ----
+//
+// Deliberately unauthenticated: see pushTokens.js. The app re-POSTs on every
+// launch, so a repeat is the normal case and not an error.
+app.post('/api/v2/push/tokens', async (req, res) => {
+  try {
+    const now = new Date();
+    const doc = pushTokenDocument(req.body, now);
+    if (!doc) return fail(res, 400, 'invalid_token', 'token must be an ExponentPushToken[...]');
+
+    const { createdAt, ...rest } = doc;
+    await db.collection('pushTokens').updateOne(
+      { token: doc.token },
+      // `createdAt` is set once. A re-registration updates `lastSeen` and the
+      // two version axes, and never rewrites the day the device first appeared.
+      { $set: rest, $setOnInsert: { createdAt } },
+      { upsert: true }
+    );
+
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/v2/push/tokens error:', err);
     fail(res, 500, 'internal', err.message);
   }
 });
