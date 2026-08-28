@@ -10,6 +10,8 @@ const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
 const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 const { searchQuery, searchLimit } = require('./search');
+const { parsePeriodId, daysBetween, istDate } = require('./period');
+const { categoryName } = require('./categories');
 
 const app = express();
 app.use(cors());
@@ -688,6 +690,79 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
     res.json({ id: req.params.id, hidden });
   } catch (err) {
     console.error('PATCH /api/v2/articles/:id error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- GET /api/v2/periods/:id — a week, month, quarter or year at a glance ----
+//
+// The skeleton is a deterministic aggregate: always present, always truthful,
+// computable retroactively. That is what lets the screen render unconditionally
+// and treat a written summary as a bonus rather than as the content.
+app.get('/api/v2/periods/:id', async (req, res) => {
+  try {
+    const period = parsePeriodId(req.params.id);
+    // 404 is ONLY for a malformed id or one outside the year bounds. An empty
+    // in-range period is not a 404: a period is a calendar interval that always
+    // exists, and sparsity is the normal case here — roughly three days in four
+    // carry no edition, so "a month at a glance" is legitimately one edition.
+    if (!period) return fail(res, 404, 'not_found', 'no period with that id');
+
+    const { from, to } = period.range;
+    const match = { ...VISIBLE, _dateKey: { $gte: from, $lte: to } };
+
+    // One pass, two groupings. Counts exclude hidden articles everywhere, so
+    // they agree with what the feed shows — a count that disagrees with the
+    // list it summarises is a bug report waiting to happen.
+    const [facets] = await db.collection('articles').aggregate([
+      { $match: match },
+      {
+        $facet: {
+          byDay: [{ $group: { _id: '$_dateKey', count: { $sum: 1 } } }],
+          byCategory: [{ $group: { _id: '$category', count: { $sum: 1 } } }],
+        },
+      },
+    ]).toArray();
+
+    const byDay = new Map((facets.byDay || []).map(row => [row._id, row.count]));
+    const articleCount = [...byDay.values()].reduce((sum, n) => sum + n, 0);
+
+    // One entry per day in the range, including the days with nothing — so the
+    // timeline draws a day with no edition as a tick rather than as a gap.
+    const timeline = daysBetween(period.range).map(date => ({
+      date,
+      count: byDay.get(date) || 0,
+    }));
+
+    const categories = (facets.byCategory || [])
+      .map(row => ({ slug: row._id, name: categoryName(row._id), count: row.count }))
+      .sort((a, b) => b.count - a.count || a.slug.localeCompare(b.slug));
+
+    // A period is open until its last day is behind us, in the paper's own
+    // timezone. An open period is still accumulating, so there is nothing to
+    // summarise yet; an empty one has nothing to summarise at all.
+    const open = to >= istDate(Date.now());
+    const proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
+
+    // A closed period can never gain or lose an article — the date key is
+    // derived from push time and is part of the article id — so it is as
+    // cacheable as a past edition.
+    res.set('Cache-Control', open ? 'public, max-age=300' : 'public, max-age=86400');
+    res.json({
+      id: period.id,
+      kind: period.kind,
+      range: period.range,
+      editionCount: byDay.size,
+      articleCount,
+      categories,
+      timeline,
+      // F14 fills these in. Until then a closed period correctly says a summary
+      // has not been added yet, and an open one says it is still open.
+      prose: null,
+      proseStatus,
+    });
+  } catch (err) {
+    console.error('GET /api/v2/periods/:id error:', err);
     fail(res, 500, 'internal', err.message);
   }
 });
