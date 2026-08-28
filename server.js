@@ -11,6 +11,10 @@ const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 const { searchQuery, searchLimit } = require('./search');
 const { parsePeriodId, daysBetween, istDate } = require('./period');
+const {
+  TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS,
+  resolveModel, buildPrompt, parseModelReply, validateProse,
+} = require('./prose');
 const { categoryName } = require('./categories');
 
 const app = express();
@@ -27,6 +31,13 @@ const DB_NAME = process.env.MONGODB_DB || 'fayznews';
 // an unauthenticated push and logs it, so shipping the backend can never stop
 // the pipeline; flip it to true once the extension sends the header.
 const CHRONICLE_KEY = process.env.CHRONICLE_KEY || '';
+// The generator's key and model, both from the environment, exactly as the
+// instagram-news-summarizer extension already does it. With the key unset,
+// generation does not run and does not throw: the period keeps its "pending"
+// status and its skeleton renders, so a backend deployed without the key is
+// degraded and never broken. Neither value is ever logged.
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = resolveModel(process.env.OPENROUTER_MODEL);
 const REQUIRE_PUSH_KEY = String(process.env.REQUIRE_PUSH_KEY || '').toLowerCase() === 'true';
 
 // Canonical order for display
@@ -694,6 +705,83 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
   }
 });
 
+// ---- the period retrospective ----
+//
+// Generated lazily, once, on first view of a CLOSED period, then stored for
+// ever. No cron, no queue, no staleness tracking, and **no rate limiting** —
+// closed periods are immutable, because a date key is derived from push time
+// and is part of the article id, so an article can never land in a past period
+// and a re-push can never touch one. Generation is once, only closed periods
+// generate, and the set of closed periods is finite and small: the worst anyone
+// can force is "generate every ungenerated period once", the same spend that
+// would have happened anyway. Lifetime cost is bounded by the calendar, not by
+// traffic. **The immutability rule is the rate limit.**
+//
+// Prose lives in its own collection because `articles` has spent its one text
+// index slot on search (see docs/adr/0001).
+const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
+
+async function askOpenRouter(prompt) {
+  const response = await fetch(OPENROUTER_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: TEMPERATURE,
+      max_tokens: MAX_TOKENS,
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    // The status, never the body: an error body can echo the request, and the
+    // request carries the key.
+    throw new Error(`OpenRouter answered ${response.status}`);
+  }
+  const payload = await response.json();
+  const reply = payload && payload.choices && payload.choices[0]
+    && payload.choices[0].message && payload.choices[0].message.content;
+  // An empty completion is a failure, not an empty summary.
+  if (typeof reply !== 'string' || !reply.trim()) throw new Error('OpenRouter returned no content');
+  return reply;
+}
+
+async function generateProse(period, categories) {
+  if (!OPENROUTER_API_KEY) return null;
+
+  // Headlines only, never bodies. A year reads its own headlines rather than
+  // four quarter summaries, so summarisation error does not compound.
+  const rows = await db.collection('articles')
+    .find(
+      { ...VISIBLE, _dateKey: { $gte: period.range.from, $lte: period.range.to } },
+      { projection: { headline: 1, category: 1, _id: 0 } }
+    )
+    .toArray();
+  const headlinesBySlug = {};
+  for (const row of rows) {
+    (headlinesBySlug[row.category] = headlinesBySlug[row.category] || []).push(row.headline);
+  }
+
+  const reply = await askOpenRouter(buildPrompt(period, categories, headlinesBySlug));
+  // Validated before storage. The app parses defensively as well, but a
+  // malformed generation should never reach the collection in the first place.
+  const prose = validateProse(parseModelReply(reply), categories);
+  if (!prose) throw new Error('OpenRouter returned nothing that fits the shape');
+
+  // $setOnInsert, so two readers opening the same period at the same moment
+  // store one summary and the loser discards its own rather than overwriting.
+  await db.collection('periodProse').updateOne(
+    { periodId: period.id },
+    { $setOnInsert: { periodId: period.id, prose, model: OPENROUTER_MODEL, generatedAt: new Date() } },
+    { upsert: true }
+  );
+  const stored = await db.collection('periodProse').findOne({ periodId: period.id });
+  return stored ? stored.prose : prose;
+}
+
 // ---- GET /api/v2/periods/:id — a week, month, quarter or year at a glance ----
 //
 // The skeleton is a deterministic aggregate: always present, always truthful,
@@ -742,7 +830,25 @@ app.get('/api/v2/periods/:id', async (req, res) => {
     // timezone. An open period is still accumulating, so there is nothing to
     // summarise yet; an empty one has nothing to summarise at all.
     const open = to >= istDate(Date.now());
-    const proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
+    let proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
+    let prose = null;
+
+    if (!open && articleCount > 0) {
+      const stored = await db.collection('periodProse').findOne({ periodId: period.id });
+      if (stored) {
+        // Every later view reads the stored copy and makes no model call.
+        prose = stored.prose;
+      } else {
+        try {
+          prose = await generateProse(period, categories);
+        } catch (err) {
+          // A generation failure leaves the status unchanged and the skeleton
+          // still rendering. The period is worth looking at either way.
+          console.error(`generating prose for ${period.id} failed:`, err.message);
+        }
+      }
+      if (prose) proseStatus = 'ready';
+    }
 
     // A closed period can never gain or lose an article — the date key is
     // derived from push time and is part of the article id — so it is as
@@ -756,9 +862,7 @@ app.get('/api/v2/periods/:id', async (req, res) => {
       articleCount,
       categories,
       timeline,
-      // F14 fills these in. Until then a closed period correctly says a summary
-      // has not been added yet, and an open one says it is still open.
-      prose: null,
+      prose,
       proseStatus,
     });
   } catch (err) {
