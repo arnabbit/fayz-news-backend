@@ -9,6 +9,7 @@ const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
 const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
+const { searchQuery, searchLimit } = require('./search');
 
 const app = express();
 app.use(cors());
@@ -596,6 +597,54 @@ app.get('/api/v2/editions/:date/articles', async (req, res) => {
     });
   } catch (err) {
     console.error('GET /api/v2/editions/:date/articles error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- GET /api/v2/search?q=&cursor=&limit= — the whole archive, by words ----
+app.get('/api/v2/search', async (req, res) => {
+  try {
+    const q = searchQuery(req.query.q);
+    if (!q) return fail(res, 400, 'invalid_query', 'q must be 2 to 100 characters');
+
+    const limit = searchLimit(req.query.limit);
+    const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
+    if (cursor && !ObjectId.isValid(cursor)) {
+      return fail(res, 400, 'invalid_cursor', 'cursor must be a cursor from a previous page');
+    }
+
+    const query = { ...VISIBLE, $text: { $search: q } };
+    if (cursor) query._id = { $lt: new ObjectId(cursor) };
+
+    // **Recency, not textScore.** `$text` scores on term frequency normalised
+    // by document length, and over 83-word digests that is statistical noise
+    // dressed as relevance; in a newspaper archive someone searching a running
+    // story almost always wants the most recent mention. It also keeps
+    // pagination on `_id` descending, like every other v2 list endpoint —
+    // paginating on a computed float is painful and nothing else here does it.
+    //
+    // Verified rather than assumed: `$text` with this sort cannot use an index
+    // for the sort, so Mongo sorts in memory — bounded at 32 MB against a
+    // corpus of roughly 700 KB. Not close.
+    const rows = await db.collection('articles')
+      .find(query, { projection: { ...FEED_PROJECTION, _id: 1 } })
+      .sort({ _id: -1 })
+      .limit(limit + 1)
+      .toArray();
+
+    const hasNext = rows.length > limit;
+    const docs = rows.slice(0, limit);
+
+    // Results span the whole archive, so no single edition's immutability
+    // applies. Five minutes, like anything that can include today.
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({
+      articles: docs.map(toFeedItem),
+      has_next: hasNext,
+      next_cursor: hasNext ? String(docs[docs.length - 1]._id) : null,
+    });
+  } catch (err) {
+    console.error('GET /api/v2/search error:', err);
     fail(res, 500, 'internal', err.message);
   }
 });
