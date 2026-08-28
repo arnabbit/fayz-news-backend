@@ -48,6 +48,18 @@ async function connectDB() {
   await db.collection('articles').createIndex({ category: 1 });
   await db.collection('articles').createIndex({ _dateKey: 1, _id: -1 });
   await db.collection('articles').createIndex({ _dateKey: 1, category: 1, _id: -1 });
+  // The one text index this collection will ever have — MongoDB allows exactly
+  // one per collection, and this spends it. Two consequences, recorded in
+  // docs/adr/ rather than discovered later: `$text` queries every indexed field
+  // at once, so a headline-only search mode is impossible without dropping and
+  // rebuilding this; and nothing else on `articles` can ever have its own text
+  // index. `sourcePosts` is excluded on principle — those are other outlets'
+  // headlines, kept for audit, and matching them would surface an article for
+  // words the article itself never says.
+  await db.collection('articles').createIndex(
+    { headline: 'text', body: 'text', 'developments.summary': 'text' },
+    { weights: { headline: 10, body: 1, 'developments.summary': 3 }, name: 'article_text' }
+  );
   // So the ninety-day sweep is one indexed deleteMany rather than a collection
   // scan on the same request that just sent every notification.
   await db.collection('pushTokens').createIndex({ lastSeen: 1 });
