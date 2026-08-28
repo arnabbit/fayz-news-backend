@@ -83,10 +83,34 @@ async function connectDB() {
       { weights: { headline: 10, body: 1, 'developments.summary': 3 }, name: 'article_text' }
     );
   } catch (err) {
+    // Names the blocker and the remedy, because the message this replaced sent
+    // the reader to an ADR that asserted the slot was free — and it was not.
+    const existing = (await db.collection('articles').indexes())
+      .filter(index => JSON.stringify(index.key).includes('_fts'))
+      .map(index => `${index.name} over ${Object.keys(index.weights || {}).join(', ')}`);
     console.error(
-      'WARNING: could not create the text index on `articles` — search will return '
-      + 'nothing until this is resolved. A conflicting text index already exists, or '
-      + 'this one needs dropping and rebuilding (see docs/adr/0001).',
+      'WARNING: `articles` already carries a text index, so search is running '
+      + 'against THAT index and not the one this code asks for. Mongo allows one '
+      + 'per collection.\n'
+      + `  existing: ${existing.join(' | ') || 'unknown'}\n`
+      + '  wanted:   article_text over headline (10), developments.summary (3), body (1)\n'
+      + '  remedy:   node scripts/replace-text-index.js --apply   (see docs/adr/0001)\n'
+      + '  until then, search matches every field the existing index covers — '
+      + 'which may include fields deliberately excluded from search.',
+      err.message
+    );
+  }
+  // Makes the prose claim atomic: a period that already holds a summary cannot
+  // be claimed for a second generation.
+  try {
+    await db.collection('periodProse').createIndex(
+      { periodId: 1 },
+      { unique: true, name: 'periodId_unique' }
+    );
+  } catch (err) {
+    console.error(
+      'WARNING: could not create the unique index on `periodProse.periodId` — '
+      + 'duplicate summaries are possible until this is resolved.',
       err.message
     );
   }
@@ -765,6 +789,37 @@ async function askOpenRouter(prompt) {
   return reply;
 }
 
+// Three tries and the period is left alone. Without a cap, a period the model
+// cannot summarise — a shape it keeps getting wrong, a prompt that trips a
+// filter — is retried on every single view for ever, which is the one way the
+// "immutability is the rate limit" argument in docs/adr/0003 can be defeated.
+const MAX_PROSE_ATTEMPTS = 3;
+
+// Claims the right to generate. Backed by the unique index on `periodId`, so a
+// document that already holds prose makes the upsert collide rather than start a
+// second generation. Returns false when the period is done, being done, or has
+// spent its attempts.
+//
+// This bounds spend rather than serialising perfectly: two requests arriving in
+// the same instant can both claim, because the counter is incremented rather
+// than leased. Bounded double-spend on a rare race is a fair trade against a
+// lease that has to expire correctly, given generation happens once per period
+// for the life of the archive.
+async function claimProse(periodId) {
+  try {
+    const result = await db.collection('periodProse').updateOne(
+      { periodId, prose: { $exists: false }, attempts: { $lt: MAX_PROSE_ATTEMPTS } },
+      { $inc: { attempts: 1 }, $set: { lastAttemptAt: new Date() }, $setOnInsert: { periodId } },
+      { upsert: true }
+    );
+    return result.upsertedCount === 1 || result.modifiedCount === 1;
+  } catch (err) {
+    // Duplicate key: another writer holds this period, or it is already written.
+    if (err.code === 11000) return false;
+    throw err;
+  }
+}
+
 async function generateProse(period, categories) {
   if (!OPENROUTER_API_KEY) return null;
 
@@ -787,15 +842,15 @@ async function generateProse(period, categories) {
   const prose = validateProse(parseModelReply(reply), categories);
   if (!prose) throw new Error('OpenRouter returned nothing that fits the shape');
 
-  // $setOnInsert, so two readers opening the same period at the same moment
-  // store one summary and the loser discards its own rather than overwriting.
+  // Filtered on prose being absent, so the first store wins and any racer's
+  // work is discarded rather than overwriting a summary a reader may already
+  // have been served.
   await db.collection('periodProse').updateOne(
-    { periodId: period.id },
-    { $setOnInsert: { periodId: period.id, prose, model: OPENROUTER_MODEL, generatedAt: new Date() } },
-    { upsert: true }
+    { periodId: period.id, prose: { $exists: false } },
+    { $set: { prose, model: OPENROUTER_MODEL, generatedAt: new Date() } }
   );
   const stored = await db.collection('periodProse').findOne({ periodId: period.id });
-  return stored ? stored.prose : prose;
+  return stored && stored.prose ? stored.prose : prose;
 }
 
 // ---- GET /api/v2/periods/:id — a week, month, quarter or year at a glance ----
@@ -848,28 +903,29 @@ app.get('/api/v2/periods/:id', async (req, res) => {
     const open = to >= istDate(Date.now());
     let proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
     let prose = null;
+    const summarisable = !open && articleCount > 0;
 
-    if (!open && articleCount > 0) {
+    if (summarisable) {
       const stored = await db.collection('periodProse').findOne({ periodId: period.id });
-      if (stored) {
-        // Every later view reads the stored copy and makes no model call.
+      // Every later view reads the stored copy and makes no model call.
+      if (stored && stored.prose) {
         prose = stored.prose;
-      } else {
-        try {
-          prose = await generateProse(period, categories);
-        } catch (err) {
-          // A generation failure leaves the status unchanged and the skeleton
-          // still rendering. The period is worth looking at either way.
-          console.error(`generating prose for ${period.id} failed:`, err.message);
-        }
+        proseStatus = 'ready';
       }
-      if (prose) proseStatus = 'ready';
     }
 
-    // A closed period can never gain or lose an article — the date key is
-    // derived from push time and is part of the article id — so it is as
-    // cacheable as a past edition.
-    res.set('Cache-Control', open ? 'public, max-age=300' : 'public, max-age=86400');
+    // **The response never waits on the model.** docs/adr/0003 rejects "waiting
+    // for the prose before serving anything" in as many words, and the first
+    // implementation did exactly that — awaiting a call with a 90-second
+    // timeout, so a cold first view of a closed period could time out at the
+    // gateway and return no skeleton at all. The skeleton is the half that is
+    // always true; it goes out now and the summary arrives on a later view.
+    //
+    // Which makes the cache header load-bearing: a closed period whose prose is
+    // still pending is NOT immutable, because it is about to change. Only a
+    // settled period gets the long cache.
+    const settled = !summarisable || proseStatus === 'ready';
+    res.set('Cache-Control', !open && settled ? 'public, max-age=86400' : 'public, max-age=300');
     res.json({
       id: period.id,
       kind: period.kind,
@@ -881,6 +937,22 @@ app.get('/api/v2/periods/:id', async (req, res) => {
       prose,
       proseStatus,
     });
+
+    // After the response, and unable to fail it. The claim is what stops this
+    // being one model call per view: it is backed by a unique index, counts its
+    // attempts, and gives up after three.
+    if (summarisable && proseStatus === 'pending' && OPENROUTER_API_KEY) {
+      claimProse(period.id)
+        .then(claimed => (claimed ? generateProse(period, categories) : null))
+        .then(written => {
+          if (written) console.log(`wrote prose for ${period.id}`);
+        })
+        .catch(err => {
+          // The attempt is already recorded, so a period that keeps failing
+          // stops being tried rather than being retried for ever.
+          console.error(`generating prose for ${period.id} failed:`, err.message);
+        });
+    }
   } catch (err) {
     console.error('GET /api/v2/periods/:id error:', err);
     fail(res, 500, 'internal', err.message);

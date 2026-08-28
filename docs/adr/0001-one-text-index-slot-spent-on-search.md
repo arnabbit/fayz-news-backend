@@ -29,6 +29,44 @@ relevance. In a newspaper archive, someone searching a running story almost
 always wants the most recent mention. It would also mean paginating on a
 computed float where every other v2 endpoint paginates on `_id`.
 
+## Correction — the slot was never free
+
+An earlier revision of this ADR said `articles` carried only `{_dateKey, _id}`
+and `{_dateKey, category, _id}`, "so the slot is free". **That was wrong**, and it
+was wrong about production rather than about the code: the deployed collection
+already carried a text index named `article_archive_text`, over
+
+```
+body(1)  category(1)  developments.summary(1)  headline(1)  sourcePosts.sourceHeadline(1)
+```
+
+created outside this repository and recorded nowhere in it. So the first deploy
+of the search work could not build `article_text`, and — because `$text` uses
+whichever text index exists — **search has been answering against that index
+instead.** Two consequences were live in production and reported as verified when
+they were not:
+
+- **`sourcePosts.sourceHeadline` is searched**, so an article matches words only
+  its *sources* say. The criterion "matching a word that appears only in
+  `sourcePosts` returns nothing" held locally and failed in production.
+- **`category` is searched**, so every article in a section matches that
+  section's name. Confirmed against the live API: a search for `entertainment`
+  returns an article whose headline, body and developments never use the word.
+
+Weights are the harmless half of the difference. This endpoint sorts by `_id`
+descending and never reads `textScore`, so the flat weights change nothing about
+what order results come back in — only which documents match at all.
+
+`scripts/replace-text-index.js` reports the discrepancy and, with `--apply`,
+drops the old index and builds the specified one. It is deliberately a script
+rather than something `connectDB` does at boot: dropping an index somebody else
+created should be a decision, not a side effect of a deploy.
+
+The lesson worth keeping is not about indexes. **The ADR asserted a fact about a
+database it had not read**, and the assertion then justified leaving the create
+call unguarded, which took the whole API down on the first deploy that met
+reality.
+
 ## Consequences
 
 **MongoDB allows exactly one text index per collection, and this is it.** Read

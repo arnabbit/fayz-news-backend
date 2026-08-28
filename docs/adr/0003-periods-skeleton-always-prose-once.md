@@ -69,8 +69,27 @@ The period keeps `proseStatus: "pending"` and its skeleton renders, which is
 already the specified state for a closed period with no summary. A backend
 deployed without the key is degraded, never broken.
 
-The first view of a closed period pays for the model call. Once per period,
-ever.
+**The response never waits on the model.** The first implementation of this ADR
+contradicted the ADR: it awaited the call inline, with a 90-second timeout, so a
+first view of a closed period could time out at the gateway and return no
+skeleton — the exact alternative rejected above. Generation now runs after the
+response. The first view of a closed period gets the skeleton and
+`proseStatus: "pending"`; a later view gets the summary.
+
+That makes the cache header part of the contract: **a closed period whose prose
+is still pending is not immutable**, because it is about to change, so it caches
+for five minutes rather than a day. Only a settled period — summarised, or empty
+and therefore never to be summarised — gets the long cache. The app's query layer
+must make the same distinction, or the first reader of a period caches "no
+summary" for ever.
+
+Generation is claimed, not merely attempted: `periodProse.periodId` carries a
+unique index, and the claim counts attempts and gives up after three. Without
+that cap a period the model cannot summarise is retried on every view for ever,
+which is the one way the immutability-as-rate-limit argument above can be
+defeated. The claim bounds spend rather than serialising perfectly — two requests
+in the same instant can both claim — which is a fair trade against a lease that
+has to expire correctly, for something that happens once per period.
 
 **The order `byCategory` is stored in is the ranking**, and nothing downstream
 re-sorts it — a period view has no headline list, so the data cannot supply an
