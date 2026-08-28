@@ -7,6 +7,15 @@ const { editionDateKey, editionDateLabel } = require('./editionDate');
 const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
+const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
+const { editionNotification } = require('./pushCopy');
+const { searchQuery, searchLimit } = require('./search');
+const { parsePeriodId, daysBetween, istDate } = require('./period');
+const {
+  TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS,
+  resolveModel, buildPrompt, parseModelReply, validateProse,
+} = require('./prose');
+const { categoryName } = require('./categories');
 
 const app = express();
 app.use(cors());
@@ -22,6 +31,13 @@ const DB_NAME = process.env.MONGODB_DB || 'fayznews';
 // an unauthenticated push and logs it, so shipping the backend can never stop
 // the pipeline; flip it to true once the extension sends the header.
 const CHRONICLE_KEY = process.env.CHRONICLE_KEY || '';
+// The generator's key and model, both from the environment, exactly as the
+// instagram-news-summarizer extension already does it. With the key unset,
+// generation does not run and does not throw: the period keeps its "pending"
+// status and its skeleton renders, so a backend deployed without the key is
+// degraded and never broken. Neither value is ever logged.
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = resolveModel(process.env.OPENROUTER_MODEL);
 const REQUIRE_PUSH_KEY = String(process.env.REQUIRE_PUSH_KEY || '').toLowerCase() === 'true';
 
 // Canonical order for display
@@ -46,6 +62,21 @@ async function connectDB() {
   await db.collection('articles').createIndex({ category: 1 });
   await db.collection('articles').createIndex({ _dateKey: 1, _id: -1 });
   await db.collection('articles').createIndex({ _dateKey: 1, category: 1, _id: -1 });
+  // The one text index this collection will ever have — MongoDB allows exactly
+  // one per collection, and this spends it. Two consequences, recorded in
+  // docs/adr/ rather than discovered later: `$text` queries every indexed field
+  // at once, so a headline-only search mode is impossible without dropping and
+  // rebuilding this; and nothing else on `articles` can ever have its own text
+  // index. `sourcePosts` is excluded on principle — those are other outlets'
+  // headlines, kept for audit, and matching them would surface an article for
+  // words the article itself never says.
+  await db.collection('articles').createIndex(
+    { headline: 'text', body: 'text', 'developments.summary': 'text' },
+    { weights: { headline: 10, body: 1, 'developments.summary': 3 }, name: 'article_text' }
+  );
+  // So the ninety-day sweep is one indexed deleteMany rather than a collection
+  // scan on the same request that just sent every notification.
+  await db.collection('pushTokens').createIndex({ lastSeen: 1 });
   // Article identity is content-derived; the unique index is the last line of
   // defence against a duplicate insert racing two concurrent pushes.
   try {
@@ -176,6 +207,90 @@ function cleanSourcePosts(value) {
   })).filter(item => item.postUrl || item.sourceHeadline);
 }
 
+// ---- the sender ----
+//
+// Inline and fire-and-forget, because the free dyno sleeps: the push POST is
+// the one moment this process is provably awake, holding exactly the facts
+// needed. No cron, no queue, no retry. It also means a reader's tap lands
+// inside the five-minute `latest` window while the dyno is still warm — the one
+// notification-driven request in the app that will not hit a cold start.
+const EXPO_PUSH_ENDPOINT = 'https://exp.host/--/api/v2/push/send';
+const EXPO_PUSH_BATCH = 100;
+
+// **Sending is gated on REQUIRE_PUSH_KEY, and that is deliberate.** A spurious
+// article is one bad row in a list; a spurious push is a notification on every
+// reader's phone. The write endpoint accepts unauthenticated pushes while the
+// key requirement is off, so sending during that phase would let anyone who
+// found the URL wake every device. The same flag that closes the door is the
+// one that opens the sender: the cutover is a single switch, not a checklist
+// item somebody has to remember.
+function pushSendingEnabled() {
+  return REQUIRE_PUSH_KEY;
+}
+
+async function sendEditionNotification(dateKey) {
+  if (!pushSendingEnabled()) {
+    console.log(`edition ${dateKey} born; not notifying (REQUIRE_PUSH_KEY is off)`);
+    return;
+  }
+
+  // The count excludes hidden articles, so it matches what a reader opening the
+  // paper will actually find.
+  const count = await db.collection('articles').countDocuments({ ...VISIBLE, _dateKey: dateKey });
+  const message = editionNotification(dateKey, count);
+  if (!message) return;
+
+  const tokens = await db.collection('pushTokens')
+    .find({}, { projection: { token: 1 } })
+    .toArray();
+  if (tokens.length === 0) return;
+
+  const unregistered = [];
+  for (let i = 0; i < tokens.length; i += EXPO_PUSH_BATCH) {
+    const batch = tokens.slice(i, i + EXPO_PUSH_BATCH);
+    const response = await fetch(EXPO_PUSH_ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(batch.map(row => ({ to: row.token, ...message }))),
+    });
+    const payload = await response.json();
+    const tickets = Array.isArray(payload && payload.data) ? payload.data : [];
+    // Ticket order mirrors message order, which is how a per-ticket error is
+    // attributed back to the token that caused it.
+    tickets.forEach((ticket, index) => {
+      if (ticket && ticket.status === 'error'
+          && ticket.details && ticket.details.error === 'DeviceNotRegistered') {
+        unregistered.push(batch[index].token);
+      }
+    });
+  }
+
+  console.log(`notified ${tokens.length} device(s) of edition ${dateKey}`);
+  return unregistered;
+}
+
+// ---- the prune ----
+//
+// Two signals, both on the occasion that already exists. **Receipts are
+// deliberately not fetched at all**, reversing the obvious design: the tempting
+// scheme was to store today's ticket ids and read receipts on the *next*
+// edition's POST, since the dyno is awake then and Expo retains receipts for 24
+// hours. The publishing cadence kills it — editions average roughly one every
+// four days, so the next POST is usually well past retention and the scheme
+// would silently never prune. Neither signal below needs a retention window.
+async function pruneTokens(unregistered, now) {
+  // Signal 1: the send itself said the device is gone.
+  if (unregistered && unregistered.length > 0) {
+    const gone = await db.collection('pushTokens').deleteMany({ token: { $in: unregistered } });
+    if (gone.deletedCount) console.log(`pruned ${gone.deletedCount} unregistered device(s)`);
+  }
+  // Signal 2: ninety days of silence. The app re-POSTs on every launch, so a
+  // token this old belongs to an install that is gone or a reader who stopped
+  // opening the paper. One indexed deleteMany.
+  const stale = await db.collection('pushTokens').deleteMany({ lastSeen: { $lt: staleTokenCutoff(now) } });
+  if (stale.deletedCount) console.log(`pruned ${stale.deletedCount} stale token(s)`);
+}
+
 // ---- POST /api/articles — extension pushes articles here ----
 app.post('/api/articles', requireKey, async (req, res) => {
   try {
@@ -210,6 +325,13 @@ app.post('/api/articles', requireKey, async (req, res) => {
         sourcePosts
       };
     });
+
+    // Edition birth, evaluated BEFORE the write. "Did anything upsert" would
+    // fire again on every same-day re-push. Accepted and stated plainly: a
+    // re-push that adds forty genuinely new stories is silent — tolerable only
+    // because the app revalidates `latest` on a five-minute stale time.
+    const isNewEdition =
+      (await db.collection('articles').countDocuments({ _dateKey: dateKey }, { limit: 1 })) === 0;
 
     // Several stories can share a base id (one roundup reel, many stories).
     // Never let that silently drop or overwrite one: the first story to claim a
@@ -260,6 +382,17 @@ app.post('/api/articles', requireKey, async (req, res) => {
     );
 
     res.json({ ok: true, date, count: uniqueDocs.length });
+
+    // After the response, and unable to fail it. A notification that could not
+    // be sent is logged and dropped: the edition is published either way, and
+    // failing the extension's push over it would be the tail wagging the dog.
+    if (isNewEdition) {
+      sendEditionNotification(dateKey)
+        .then(unregistered => pruneTokens(unregistered, now))
+        .catch(err => {
+          console.error(`notifying for edition ${dateKey} failed:`, err.message);
+        });
+    }
   } catch (err) {
     console.error('POST /api/articles error:', err);
     res.status(500).json({ error: err.message });
@@ -481,6 +614,54 @@ app.get('/api/v2/editions/:date/articles', async (req, res) => {
   }
 });
 
+// ---- GET /api/v2/search?q=&cursor=&limit= — the whole archive, by words ----
+app.get('/api/v2/search', async (req, res) => {
+  try {
+    const q = searchQuery(req.query.q);
+    if (!q) return fail(res, 400, 'invalid_query', 'q must be 2 to 100 characters');
+
+    const limit = searchLimit(req.query.limit);
+    const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
+    if (cursor && !ObjectId.isValid(cursor)) {
+      return fail(res, 400, 'invalid_cursor', 'cursor must be a cursor from a previous page');
+    }
+
+    const query = { ...VISIBLE, $text: { $search: q } };
+    if (cursor) query._id = { $lt: new ObjectId(cursor) };
+
+    // **Recency, not textScore.** `$text` scores on term frequency normalised
+    // by document length, and over 83-word digests that is statistical noise
+    // dressed as relevance; in a newspaper archive someone searching a running
+    // story almost always wants the most recent mention. It also keeps
+    // pagination on `_id` descending, like every other v2 list endpoint —
+    // paginating on a computed float is painful and nothing else here does it.
+    //
+    // Verified rather than assumed: `$text` with this sort cannot use an index
+    // for the sort, so Mongo sorts in memory — bounded at 32 MB against a
+    // corpus of roughly 700 KB. Not close.
+    const rows = await db.collection('articles')
+      .find(query, { projection: { ...FEED_PROJECTION, _id: 1 } })
+      .sort({ _id: -1 })
+      .limit(limit + 1)
+      .toArray();
+
+    const hasNext = rows.length > limit;
+    const docs = rows.slice(0, limit);
+
+    // Results span the whole archive, so no single edition's immutability
+    // applies. Five minutes, like anything that can include today.
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({
+      articles: docs.map(toFeedItem),
+      has_next: hasNext,
+      next_cursor: hasNext ? String(docs[docs.length - 1]._id) : null,
+    });
+  } catch (err) {
+    console.error('GET /api/v2/search error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
 // ---- GET /api/v2/articles/:id — the full article ----
 app.get('/api/v2/articles/:id', async (req, res) => {
   try {
@@ -520,6 +701,199 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
     res.json({ id: req.params.id, hidden });
   } catch (err) {
     console.error('PATCH /api/v2/articles/:id error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- the period retrospective ----
+//
+// Generated lazily, once, on first view of a CLOSED period, then stored for
+// ever. No cron, no queue, no staleness tracking, and **no rate limiting** —
+// closed periods are immutable, because a date key is derived from push time
+// and is part of the article id, so an article can never land in a past period
+// and a re-push can never touch one. Generation is once, only closed periods
+// generate, and the set of closed periods is finite and small: the worst anyone
+// can force is "generate every ungenerated period once", the same spend that
+// would have happened anyway. Lifetime cost is bounded by the calendar, not by
+// traffic. **The immutability rule is the rate limit.**
+//
+// Prose lives in its own collection because `articles` has spent its one text
+// index slot on search (see docs/adr/0001).
+const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
+
+async function askOpenRouter(prompt) {
+  const response = await fetch(OPENROUTER_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: TEMPERATURE,
+      max_tokens: MAX_TOKENS,
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    // The status, never the body: an error body can echo the request, and the
+    // request carries the key.
+    throw new Error(`OpenRouter answered ${response.status}`);
+  }
+  const payload = await response.json();
+  const reply = payload && payload.choices && payload.choices[0]
+    && payload.choices[0].message && payload.choices[0].message.content;
+  // An empty completion is a failure, not an empty summary.
+  if (typeof reply !== 'string' || !reply.trim()) throw new Error('OpenRouter returned no content');
+  return reply;
+}
+
+async function generateProse(period, categories) {
+  if (!OPENROUTER_API_KEY) return null;
+
+  // Headlines only, never bodies. A year reads its own headlines rather than
+  // four quarter summaries, so summarisation error does not compound.
+  const rows = await db.collection('articles')
+    .find(
+      { ...VISIBLE, _dateKey: { $gte: period.range.from, $lte: period.range.to } },
+      { projection: { headline: 1, category: 1, _id: 0 } }
+    )
+    .toArray();
+  const headlinesBySlug = {};
+  for (const row of rows) {
+    (headlinesBySlug[row.category] = headlinesBySlug[row.category] || []).push(row.headline);
+  }
+
+  const reply = await askOpenRouter(buildPrompt(period, categories, headlinesBySlug));
+  // Validated before storage. The app parses defensively as well, but a
+  // malformed generation should never reach the collection in the first place.
+  const prose = validateProse(parseModelReply(reply), categories);
+  if (!prose) throw new Error('OpenRouter returned nothing that fits the shape');
+
+  // $setOnInsert, so two readers opening the same period at the same moment
+  // store one summary and the loser discards its own rather than overwriting.
+  await db.collection('periodProse').updateOne(
+    { periodId: period.id },
+    { $setOnInsert: { periodId: period.id, prose, model: OPENROUTER_MODEL, generatedAt: new Date() } },
+    { upsert: true }
+  );
+  const stored = await db.collection('periodProse').findOne({ periodId: period.id });
+  return stored ? stored.prose : prose;
+}
+
+// ---- GET /api/v2/periods/:id — a week, month, quarter or year at a glance ----
+//
+// The skeleton is a deterministic aggregate: always present, always truthful,
+// computable retroactively. That is what lets the screen render unconditionally
+// and treat a written summary as a bonus rather than as the content.
+app.get('/api/v2/periods/:id', async (req, res) => {
+  try {
+    const period = parsePeriodId(req.params.id);
+    // 404 is ONLY for a malformed id or one outside the year bounds. An empty
+    // in-range period is not a 404: a period is a calendar interval that always
+    // exists, and sparsity is the normal case here — roughly three days in four
+    // carry no edition, so "a month at a glance" is legitimately one edition.
+    if (!period) return fail(res, 404, 'not_found', 'no period with that id');
+
+    const { from, to } = period.range;
+    const match = { ...VISIBLE, _dateKey: { $gte: from, $lte: to } };
+
+    // One pass, two groupings. Counts exclude hidden articles everywhere, so
+    // they agree with what the feed shows — a count that disagrees with the
+    // list it summarises is a bug report waiting to happen.
+    const [facets] = await db.collection('articles').aggregate([
+      { $match: match },
+      {
+        $facet: {
+          byDay: [{ $group: { _id: '$_dateKey', count: { $sum: 1 } } }],
+          byCategory: [{ $group: { _id: '$category', count: { $sum: 1 } } }],
+        },
+      },
+    ]).toArray();
+
+    const byDay = new Map((facets.byDay || []).map(row => [row._id, row.count]));
+    const articleCount = [...byDay.values()].reduce((sum, n) => sum + n, 0);
+
+    // One entry per day in the range, including the days with nothing — so the
+    // timeline draws a day with no edition as a tick rather than as a gap.
+    const timeline = daysBetween(period.range).map(date => ({
+      date,
+      count: byDay.get(date) || 0,
+    }));
+
+    const categories = (facets.byCategory || [])
+      .map(row => ({ slug: row._id, name: categoryName(row._id), count: row.count }))
+      .sort((a, b) => b.count - a.count || a.slug.localeCompare(b.slug));
+
+    // A period is open until its last day is behind us, in the paper's own
+    // timezone. An open period is still accumulating, so there is nothing to
+    // summarise yet; an empty one has nothing to summarise at all.
+    const open = to >= istDate(Date.now());
+    let proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
+    let prose = null;
+
+    if (!open && articleCount > 0) {
+      const stored = await db.collection('periodProse').findOne({ periodId: period.id });
+      if (stored) {
+        // Every later view reads the stored copy and makes no model call.
+        prose = stored.prose;
+      } else {
+        try {
+          prose = await generateProse(period, categories);
+        } catch (err) {
+          // A generation failure leaves the status unchanged and the skeleton
+          // still rendering. The period is worth looking at either way.
+          console.error(`generating prose for ${period.id} failed:`, err.message);
+        }
+      }
+      if (prose) proseStatus = 'ready';
+    }
+
+    // A closed period can never gain or lose an article — the date key is
+    // derived from push time and is part of the article id — so it is as
+    // cacheable as a past edition.
+    res.set('Cache-Control', open ? 'public, max-age=300' : 'public, max-age=86400');
+    res.json({
+      id: period.id,
+      kind: period.kind,
+      range: period.range,
+      editionCount: byDay.size,
+      articleCount,
+      categories,
+      timeline,
+      prose,
+      proseStatus,
+    });
+  } catch (err) {
+    console.error('GET /api/v2/periods/:id error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- POST /api/v2/push/tokens — the push registry ----
+//
+// Deliberately unauthenticated: see pushTokens.js. The app re-POSTs on every
+// launch, so a repeat is the normal case and not an error.
+app.post('/api/v2/push/tokens', async (req, res) => {
+  try {
+    const now = new Date();
+    const doc = pushTokenDocument(req.body, now);
+    if (!doc) return fail(res, 400, 'invalid_token', 'token must be an ExponentPushToken[...]');
+
+    const { createdAt, ...rest } = doc;
+    await db.collection('pushTokens').updateOne(
+      { token: doc.token },
+      // `createdAt` is set once. A re-registration updates `lastSeen` and the
+      // two version axes, and never rewrites the day the device first appeared.
+      { $set: rest, $setOnInsert: { createdAt } },
+      { upsert: true }
+    );
+
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/v2/push/tokens error:', err);
     fail(res, 500, 'internal', err.message);
   }
 });
