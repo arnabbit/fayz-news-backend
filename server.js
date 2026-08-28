@@ -7,7 +7,7 @@ const { editionDateKey, editionDateLabel } = require('./editionDate');
 const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
-const { pushTokenDocument } = require('./pushTokens');
+const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 
 const app = express();
@@ -48,6 +48,9 @@ async function connectDB() {
   await db.collection('articles').createIndex({ category: 1 });
   await db.collection('articles').createIndex({ _dateKey: 1, _id: -1 });
   await db.collection('articles').createIndex({ _dateKey: 1, category: 1, _id: -1 });
+  // So the ninety-day sweep is one indexed deleteMany rather than a collection
+  // scan on the same request that just sent every notification.
+  await db.collection('pushTokens').createIndex({ lastSeen: 1 });
   // Article identity is content-derived; the unique index is the last line of
   // defence against a duplicate insert racing two concurrent pushes.
   try {
@@ -240,6 +243,28 @@ async function sendEditionNotification(dateKey) {
   return unregistered;
 }
 
+// ---- the prune ----
+//
+// Two signals, both on the occasion that already exists. **Receipts are
+// deliberately not fetched at all**, reversing the obvious design: the tempting
+// scheme was to store today's ticket ids and read receipts on the *next*
+// edition's POST, since the dyno is awake then and Expo retains receipts for 24
+// hours. The publishing cadence kills it — editions average roughly one every
+// four days, so the next POST is usually well past retention and the scheme
+// would silently never prune. Neither signal below needs a retention window.
+async function pruneTokens(unregistered, now) {
+  // Signal 1: the send itself said the device is gone.
+  if (unregistered && unregistered.length > 0) {
+    const gone = await db.collection('pushTokens').deleteMany({ token: { $in: unregistered } });
+    if (gone.deletedCount) console.log(`pruned ${gone.deletedCount} unregistered device(s)`);
+  }
+  // Signal 2: ninety days of silence. The app re-POSTs on every launch, so a
+  // token this old belongs to an install that is gone or a reader who stopped
+  // opening the paper. One indexed deleteMany.
+  const stale = await db.collection('pushTokens').deleteMany({ lastSeen: { $lt: staleTokenCutoff(now) } });
+  if (stale.deletedCount) console.log(`pruned ${stale.deletedCount} stale token(s)`);
+}
+
 // ---- POST /api/articles — extension pushes articles here ----
 app.post('/api/articles', requireKey, async (req, res) => {
   try {
@@ -336,9 +361,11 @@ app.post('/api/articles', requireKey, async (req, res) => {
     // be sent is logged and dropped: the edition is published either way, and
     // failing the extension's push over it would be the tail wagging the dog.
     if (isNewEdition) {
-      sendEditionNotification(dateKey).catch(err => {
-        console.error(`notifying for edition ${dateKey} failed:`, err.message);
-      });
+      sendEditionNotification(dateKey)
+        .then(unregistered => pruneTokens(unregistered, now))
+        .catch(err => {
+          console.error(`notifying for edition ${dateKey} failed:`, err.message);
+        });
     }
   } catch (err) {
     console.error('POST /api/articles error:', err);
