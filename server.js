@@ -8,6 +8,7 @@ const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
 const { pushTokenDocument } = require('./pushTokens');
+const { editionNotification } = require('./pushCopy');
 
 const app = express();
 app.use(cors());
@@ -177,6 +178,68 @@ function cleanSourcePosts(value) {
   })).filter(item => item.postUrl || item.sourceHeadline);
 }
 
+// ---- the sender ----
+//
+// Inline and fire-and-forget, because the free dyno sleeps: the push POST is
+// the one moment this process is provably awake, holding exactly the facts
+// needed. No cron, no queue, no retry. It also means a reader's tap lands
+// inside the five-minute `latest` window while the dyno is still warm — the one
+// notification-driven request in the app that will not hit a cold start.
+const EXPO_PUSH_ENDPOINT = 'https://exp.host/--/api/v2/push/send';
+const EXPO_PUSH_BATCH = 100;
+
+// **Sending is gated on REQUIRE_PUSH_KEY, and that is deliberate.** A spurious
+// article is one bad row in a list; a spurious push is a notification on every
+// reader's phone. The write endpoint accepts unauthenticated pushes while the
+// key requirement is off, so sending during that phase would let anyone who
+// found the URL wake every device. The same flag that closes the door is the
+// one that opens the sender: the cutover is a single switch, not a checklist
+// item somebody has to remember.
+function pushSendingEnabled() {
+  return REQUIRE_PUSH_KEY;
+}
+
+async function sendEditionNotification(dateKey) {
+  if (!pushSendingEnabled()) {
+    console.log(`edition ${dateKey} born; not notifying (REQUIRE_PUSH_KEY is off)`);
+    return;
+  }
+
+  // The count excludes hidden articles, so it matches what a reader opening the
+  // paper will actually find.
+  const count = await db.collection('articles').countDocuments({ ...VISIBLE, _dateKey: dateKey });
+  const message = editionNotification(dateKey, count);
+  if (!message) return;
+
+  const tokens = await db.collection('pushTokens')
+    .find({}, { projection: { token: 1 } })
+    .toArray();
+  if (tokens.length === 0) return;
+
+  const unregistered = [];
+  for (let i = 0; i < tokens.length; i += EXPO_PUSH_BATCH) {
+    const batch = tokens.slice(i, i + EXPO_PUSH_BATCH);
+    const response = await fetch(EXPO_PUSH_ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(batch.map(row => ({ to: row.token, ...message }))),
+    });
+    const payload = await response.json();
+    const tickets = Array.isArray(payload && payload.data) ? payload.data : [];
+    // Ticket order mirrors message order, which is how a per-ticket error is
+    // attributed back to the token that caused it.
+    tickets.forEach((ticket, index) => {
+      if (ticket && ticket.status === 'error'
+          && ticket.details && ticket.details.error === 'DeviceNotRegistered') {
+        unregistered.push(batch[index].token);
+      }
+    });
+  }
+
+  console.log(`notified ${tokens.length} device(s) of edition ${dateKey}`);
+  return unregistered;
+}
+
 // ---- POST /api/articles — extension pushes articles here ----
 app.post('/api/articles', requireKey, async (req, res) => {
   try {
@@ -211,6 +274,13 @@ app.post('/api/articles', requireKey, async (req, res) => {
         sourcePosts
       };
     });
+
+    // Edition birth, evaluated BEFORE the write. "Did anything upsert" would
+    // fire again on every same-day re-push. Accepted and stated plainly: a
+    // re-push that adds forty genuinely new stories is silent — tolerable only
+    // because the app revalidates `latest` on a five-minute stale time.
+    const isNewEdition =
+      (await db.collection('articles').countDocuments({ _dateKey: dateKey }, { limit: 1 })) === 0;
 
     // Several stories can share a base id (one roundup reel, many stories).
     // Never let that silently drop or overwrite one: the first story to claim a
@@ -261,6 +331,15 @@ app.post('/api/articles', requireKey, async (req, res) => {
     );
 
     res.json({ ok: true, date, count: uniqueDocs.length });
+
+    // After the response, and unable to fail it. A notification that could not
+    // be sent is logged and dropped: the edition is published either way, and
+    // failing the extension's push over it would be the tail wagging the dog.
+    if (isNewEdition) {
+      sendEditionNotification(dateKey).catch(err => {
+        console.error(`notifying for edition ${dateKey} failed:`, err.message);
+      });
+    }
   } catch (err) {
     console.error('POST /api/articles error:', err);
     res.status(500).json({ error: err.message });
