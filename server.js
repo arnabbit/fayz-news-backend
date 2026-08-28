@@ -70,10 +70,26 @@ async function connectDB() {
   // index. `sourcePosts` is excluded on principle — those are other outlets'
   // headlines, kept for audit, and matching them would surface an article for
   // words the article itself never says.
-  await db.collection('articles').createIndex(
-    { headline: 'text', body: 'text', 'developments.summary': 'text' },
-    { weights: { headline: 10, body: 1, 'developments.summary': 3 }, name: 'article_text' }
-  );
+  //
+  // Guarded, for the same reason the unique index below is: a collection may
+  // already carry a text index under another name, and changing this one's
+  // weights or fields means dropping and rebuilding it — ADR 0001 contemplates
+  // exactly that. An unguarded failure here rejects connectDB and exits the
+  // process, taking every read endpoint down to degrade one. Search returning
+  // nothing is the correct blast radius for a search index that would not build.
+  try {
+    await db.collection('articles').createIndex(
+      { headline: 'text', body: 'text', 'developments.summary': 'text' },
+      { weights: { headline: 10, body: 1, 'developments.summary': 3 }, name: 'article_text' }
+    );
+  } catch (err) {
+    console.error(
+      'WARNING: could not create the text index on `articles` — search will return '
+      + 'nothing until this is resolved. A conflicting text index already exists, or '
+      + 'this one needs dropping and rebuilding (see docs/adr/0001).',
+      err.message
+    );
+  }
   // So the ninety-day sweep is one indexed deleteMany rather than a collection
   // scan on the same request that just sent every notification.
   await db.collection('pushTokens').createIndex({ lastSeen: 1 });
