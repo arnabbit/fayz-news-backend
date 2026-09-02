@@ -1,6 +1,6 @@
-# 0003 — Periods: the skeleton is always served, the prose is generated once
+# 0003 — Periods: the skeleton is always served, prose is generated lazily
 
-**Status:** accepted (F11, F12, F14)
+**Status:** accepted (F11, F12, F14); historical invalidation amended by ADR 0004
 
 ## Decision
 
@@ -9,9 +9,10 @@
 with one entry per day in the range — plus `prose` and a `proseStatus` of
 `ready | pending | none`.
 
-The prose is generated **lazily, once, on first view of a closed period**, from
-that period's **headlines only**, and stored for ever in its own `periodProse`
-collection. The generator is OpenRouter's chat completions endpoint, with both
+The prose is generated **lazily on first view of a closed period**, from that
+period's **headlines only**, and stored in its own `periodProse` collection. A
+late historical filing invalidates the affected period prose as recorded in ADR
+0004. The generator is OpenRouter's chat completions endpoint, with both
 the key (`OPENROUTER_API_KEY`) and the model (`OPENROUTER_MODEL`, falling back
 to a constant in `prose.js`) read from the environment — the convention the
 `instagram-news-summarizer` extension already uses, reused rather than
@@ -36,16 +37,12 @@ or one outside the year bounds.
 and always truthful, which is what lets the screen render unconditionally and
 treat the summary as a bonus.
 
-**A cron or a queue for generation, and staleness tracking.** Closed periods are
-immutable: the date key is derived from push time and is part of the article id,
-so an article can never land in a past period and a re-push can never touch one.
-There is nothing to invalidate.
+**A cron or a queue for generation.** Historical writes invalidate the affected
+stored prose synchronously; regeneration remains lazy and off the request path.
 
-**Rate limiting the generator.** Only closed periods generate, generation is
-once, and the set of closed periods is finite and small. The worst anyone can
-force is "generate every ungenerated period once" — the same spend that would
-have happened anyway. **Lifetime cost is bounded by the calendar, not by
-traffic; the immutability rule is the rate limit.**
+**A separate rate limiter for the generator.** Only closed periods generate and
+each generation lifecycle retains the existing three-attempt cap. Late filings
+can begin a new lifecycle by invalidating obsolete prose.
 
 **Nesting summaries.** A year is generated from its own headlines, not from four
 quarter summaries, so summarisation error does not compound.
@@ -76,12 +73,9 @@ skeleton — the exact alternative rejected above. Generation now runs after the
 response. The first view of a closed period gets the skeleton and
 `proseStatus: "pending"`; a later view gets the summary.
 
-That makes the cache header part of the contract: **a closed period whose prose
-is still pending is not immutable**, because it is about to change, so it caches
-for five minutes rather than a day. Only a settled period — summarised, or empty
-and therefore never to be summarised — gets the long cache. The app's query layer
-must make the same distinction, or the first reader of a period caches "no
-summary" for ever.
+That makes the cache header part of the contract: historical filings mean even
+a settled period can change, so period responses cache for five minutes rather
+than a day.
 
 Generation is claimed, not merely attempted: `periodProse.periodId` carries a
 unique index, and the claim counts attempts and gives up after three. Without

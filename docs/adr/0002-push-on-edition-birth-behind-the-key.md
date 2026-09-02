@@ -8,12 +8,13 @@
 `REQUIRE_PUSH_KEY`, the same flag that closes `POST /api/articles` to
 unauthenticated writes.
 
-A notification is sent on **edition birth** — `countDocuments` on the date key,
-evaluated *before* the write, returning zero — inline and fire-and-forget after
-the response. Title is the paper's name; body is `<Weekday>'s edition — N
-articles`, with the weekday derived from the date key's digits in IST and N
-excluding hidden articles. The payload is `{edition: "YYYY-MM-DD"}` and nothing
-else: no article id, no URL.
+A notification is sent when the **current IST edition is born** —
+`countDocuments` on the date key, evaluated *before* the write, returning zero —
+inline and fire-and-forget after the response. Historical edition births are
+silent as recorded in ADR 0004. Title is the paper's name; body is `<Weekday>'s
+edition — N articles`, with the weekday derived from the date key's digits in
+IST and N excluding hidden articles. The payload is
+`{edition: "YYYY-MM-DD"}` and nothing else: no article id, no URL.
 
 Tokens are pruned on two signals, both inline on that same request: a
 ticket-level `DeviceNotRegistered` in the send response, and `lastSeen` older

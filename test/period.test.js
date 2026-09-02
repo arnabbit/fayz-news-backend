@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   parsePeriodId,
   periodIdFor,
+  periodIdsForDate,
   isWithin,
   daysBetween,
   istDate,
@@ -100,6 +101,16 @@ test('a date maps to the period of each kind that contains it', () => {
   assert.equal(periodIdFor('2026-08-27', 'quarter'), '2026-Q3');
   assert.equal(periodIdFor('2026-01-01', 'quarter'), '2026-Q1');
   assert.equal(periodIdFor('2026-12-31', 'quarter'), '2026-Q4');
+});
+
+test('a date names every derived period that must be invalidated', () => {
+  assert.deepEqual(periodIdsForDate('2026-08-27'), [
+    '2026-W35', '2026-08', '2026-Q3', '2026',
+  ]);
+  assert.deepEqual(periodIdsForDate('2027-01-01'), [
+    '2026-W53', '2027-01', '2027-Q1', '2027',
+  ]);
+  assert.deepEqual(periodIdsForDate('not-a-date'), []);
 });
 
 test('a date that is not a date maps to nothing', () => {

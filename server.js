@@ -3,14 +3,14 @@ const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const { computeArticleId, qualifyArticleId, normalizeHeadline } = require('./articleId');
-const { editionDateKey, editionDateLabel } = require('./editionDate');
+const { resolveEditionDate: resolveIngestionEditionDate } = require('./editionDate');
 const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
 const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
 const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 const { searchQuery, searchLimit } = require('./search');
-const { parsePeriodId, daysBetween, istDate } = require('./period');
+const { parsePeriodId, periodIdsForDate, daysBetween, istDate } = require('./period');
 const {
   TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS,
   resolveModel, buildPrompt, parseModelReply, validateProse,
@@ -133,8 +133,8 @@ async function connectDB() {
 
 async function latestDateKey() {
   const doc = await db.collection('articles').findOne(
-    {},
-    { sort: { _createdAt: -1 }, projection: { _dateKey: 1 } }
+    { hidden: { $ne: true } },
+    { sort: { _dateKey: -1 }, projection: { _dateKey: 1 } }
   );
   return doc ? doc._dateKey : null;
 }
@@ -145,10 +145,8 @@ async function latestDateKey() {
 // disagrees with the list it summarises is a bug report waiting to happen.
 const VISIBLE = { hidden: { $ne: true } };
 
-// The latest *edition*, which is the largest `_dateKey` — not the most recently
-// created document. `latestDateKey()` above sorts by `_createdAt` and stays as
-// it is only because the dying v1 endpoints already depend on it; sorting by
-// creation time answers a different question and is subtly wrong for this one.
+// The latest *edition* is the largest `_dateKey`, never the most recently
+// inserted document. Historical filing makes that distinction load-bearing.
 async function latestEditionKey() {
   const doc = await db.collection('articles').findOne(
     VISIBLE,
@@ -169,13 +167,10 @@ function clampLimit(value, fallback, max) {
   return Math.min(max, Math.max(1, parsed));
 }
 
-// The only cold-start lever there is. A past edition can never gain or lose an
-// article, so it is cacheable for a day; anything resolved through `latest`
-// gets five minutes. Accepted cost: a same-day re-push is invisible to a web
-// reader for up to five minutes.
-function cacheEdition(res, dateKey, latestKey) {
-  const immutable = dateKey && latestKey && dateKey !== latestKey;
-  res.set('Cache-Control', immutable ? 'public, max-age=86400' : 'public, max-age=300');
+// Historical filing means every edition can change. Five minutes bounds stale
+// reads without requiring a CDN-specific purge API.
+function cacheEdition(res) {
+  res.set('Cache-Control', 'public, max-age=300');
 }
 
 // Resolves the `:date` path segment. `latest` is a valid sentinel so a cold
@@ -183,11 +178,10 @@ function cacheEdition(res, dateKey, latestKey) {
 async function resolveEditionDate(raw) {
   if (raw === 'latest') {
     const dateKey = await latestEditionKey();
-    return { dateKey, latestKey: dateKey, resolvedFromLatest: true };
+    return { dateKey, resolvedFromLatest: true };
   }
   if (!DATE_KEY.test(raw)) return { invalid: true };
-  const latestKey = await latestEditionKey();
-  return { dateKey: raw, latestKey, resolvedFromLatest: false };
+  return { dateKey: raw, resolvedFromLatest: false };
 }
 
 // A `$group` on `_dateKey`, which is what an edition *is* — there is no
@@ -243,7 +237,10 @@ function cleanSourcePosts(value) {
     sourceHeadline: String(item?.sourceHeadline || '').trim(),
     mediaTypes: cleanStringArray(item?.mediaTypes),
     captureMethods: cleanStringArray(item?.captureMethods),
-    slideCount: Number.isFinite(Number(item?.slideCount)) ? Number(item.slideCount) : 0
+    slideCount: Number.isFinite(Number(item?.slideCount)) ? Number(item.slideCount) : 0,
+    postedAt: String(item?.postedAt || '').trim(),
+    postDate: String(item?.postDate || '').trim(),
+    timestampSource: String(item?.timestampSource || '').trim(),
   })).filter(item => item.postUrl || item.sourceHeadline);
 }
 
@@ -334,15 +331,19 @@ async function pruneTokens(unregistered, now) {
 // ---- POST /api/articles — extension pushes articles here ----
 app.post('/api/articles', requireKey, async (req, res) => {
   try {
-    const { articles } = req.body;
+    const { articles, date: requestedDate } = req.body || {};
     if (!Array.isArray(articles) || articles.length === 0) {
       return res.status(400).json({ error: 'articles array required' });
     }
 
-    // Both derived in IST (see editionDate.js) — the host is UTC on Render.
     const now = new Date();
-    const date = editionDateLabel(now);
-    const dateKey = editionDateKey(now);
+    const edition = resolveIngestionEditionDate(requestedDate, now);
+    if (!edition) {
+      return res.status(400).json({
+        error: 'date must be a real, non-future IST calendar date in YYYY-MM-DD format'
+      });
+    }
+    const { dateKey, dateLabel: date } = edition;
 
     // Append-only: never delete an existing edition. A same-day second push adds
     // to it. Identity is content-derived, so a re-push of the same story (or a
@@ -366,12 +367,13 @@ app.post('/api/articles', requireKey, async (req, res) => {
       };
     });
 
-    // Edition birth, evaluated BEFORE the write. "Did anything upsert" would
-    // fire again on every same-day re-push. Accepted and stated plainly: a
-    // re-push that adds forty genuinely new stories is silent — tolerable only
-    // because the app revalidates `latest` on a five-minute stale time.
-    const isNewEdition =
-      (await db.collection('articles').countDocuments({ _dateKey: dateKey }, { limit: 1 })) === 0;
+    // Current-edition birth, evaluated BEFORE the write. Historical births are
+    // deliberately silent. "Did anything upsert" would fire again on every
+    // same-day re-push. Accepted and stated plainly: a re-push that adds forty
+    // genuinely new stories is silent — tolerable only because the app
+    // revalidates `latest` on a five-minute stale time.
+    const isNewEdition = !edition.historical
+      && (await db.collection('articles').countDocuments({ _dateKey: dateKey }, { limit: 1 })) === 0;
 
     // Several stories can share a base id (one roundup reel, many stories).
     // Never let that silently drop or overwrite one: the first story to claim a
@@ -421,7 +423,16 @@ app.post('/api/articles', requireKey, async (req, res) => {
       { ordered: false }
     );
 
-    res.json({ ok: true, date, count: uniqueDocs.length });
+    // A late filing changes every retrospective containing that edition. Drop
+    // the stored prose so the existing lazy generator can rebuild it from the
+    // new headline set. A retry is safe: deleting an absent summary is a no-op.
+    if (edition.historical) {
+      await db.collection('periodProse').deleteMany({
+        periodId: { $in: periodIdsForDate(dateKey) }
+      });
+    }
+
+    res.json({ ok: true, date, edition: dateKey, count: uniqueDocs.length });
 
     // After the response, and unable to fail it. A notification that could not
     // be sent is logged and dropped: the edition is published either way, and
@@ -569,8 +580,8 @@ app.get('/api/v2/editions', async (req, res) => {
     const hasNext = rows.length > limit;
     const editions = rows.slice(0, limit);
 
-    // A first page contains the latest edition; a cursor page is all past.
-    res.set('Cache-Control', cursor ? 'public, max-age=86400' : 'public, max-age=300');
+    // Historical filing can add an edition inside any cursor page.
+    res.set('Cache-Control', 'public, max-age=300');
     res.json({
       editions,
       has_next: hasNext,
@@ -585,7 +596,7 @@ app.get('/api/v2/editions', async (req, res) => {
 // ---- GET /api/v2/editions/:date — one edition row; :date may be "latest" ----
 app.get('/api/v2/editions/:date', async (req, res) => {
   try {
-    const { dateKey, latestKey, invalid } = await resolveEditionDate(req.params.date);
+    const { dateKey, invalid } = await resolveEditionDate(req.params.date);
     if (invalid) return fail(res, 400, 'invalid_date', 'date must be YYYY-MM-DD or "latest"');
     // A day that never had an edition is not an empty edition. Nothing links to
     // one except a hand-typed URL or a stale bookmark.
@@ -594,7 +605,7 @@ app.get('/api/v2/editions/:date', async (req, res) => {
     const [edition] = await editionRows({ ...VISIBLE, _dateKey: dateKey }, 1);
     if (!edition) return fail(res, 404, 'not_found', 'no edition for that date');
 
-    cacheEdition(res, dateKey, latestKey);
+    cacheEdition(res);
     res.json(edition);
   } catch (err) {
     console.error('GET /api/v2/editions/:date error:', err);
@@ -605,7 +616,7 @@ app.get('/api/v2/editions/:date', async (req, res) => {
 // ---- GET /api/v2/editions/:date/articles?category=&cursor=&limit= ----
 app.get('/api/v2/editions/:date/articles', async (req, res) => {
   try {
-    const { dateKey, latestKey, invalid, resolvedFromLatest } =
+    const { dateKey, invalid, resolvedFromLatest } =
       await resolveEditionDate(req.params.date);
     if (invalid) return fail(res, 400, 'invalid_date', 'date must be YYYY-MM-DD or "latest"');
     if (!dateKey) return fail(res, 404, 'not_found', 'no edition for that date');
@@ -642,7 +653,7 @@ app.get('/api/v2/editions/:date/articles', async (req, res) => {
     const hasNext = rows.length > limit;
     const docs = rows.slice(0, limit);
 
-    cacheEdition(res, dateKey, latestKey);
+    cacheEdition(res);
     res.json({
       articles: docs.map(toFeedItem),
       has_next: hasNext,
@@ -712,7 +723,7 @@ app.get('/api/v2/articles/:id', async (req, res) => {
     // not a 410 tombstone — a tombstone would confirm the story existed.
     if (!doc) return fail(res, 404, 'not_found', 'no article with that id');
 
-    cacheEdition(res, doc._dateKey, await latestEditionKey());
+    cacheEdition(res);
     res.json(toArticle(doc));
   } catch (err) {
     console.error('GET /api/v2/articles/:id error:', err);
@@ -747,15 +758,10 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
 
 // ---- the period retrospective ----
 //
-// Generated lazily, once, on first view of a CLOSED period, then stored for
-// ever. No cron, no queue, no staleness tracking, and **no rate limiting** —
-// closed periods are immutable, because a date key is derived from push time
-// and is part of the article id, so an article can never land in a past period
-// and a re-push can never touch one. Generation is once, only closed periods
-// generate, and the set of closed periods is finite and small: the worst anyone
-// can force is "generate every ungenerated period once", the same spend that
-// would have happened anyway. Lifetime cost is bounded by the calendar, not by
-// traffic. **The immutability rule is the rate limit.**
+// Generated lazily on first view of a CLOSED period. Explicit historical
+// filings invalidate the four affected period documents, so a later view can
+// regenerate prose from the new headline set. Attempts remain capped per
+// generation lifecycle to bound spend when a model repeatedly fails.
 //
 // Prose lives in its own collection because `articles` has spent its one text
 // index slot on search (see docs/adr/0001).
@@ -921,11 +927,9 @@ app.get('/api/v2/periods/:id', async (req, res) => {
     // gateway and return no skeleton at all. The skeleton is the half that is
     // always true; it goes out now and the summary arrives on a later view.
     //
-    // Which makes the cache header load-bearing: a closed period whose prose is
-    // still pending is NOT immutable, because it is about to change. Only a
-    // settled period gets the long cache.
-    const settled = !summarisable || proseStatus === 'ready';
-    res.set('Cache-Control', !open && settled ? 'public, max-age=86400' : 'public, max-age=300');
+    // Historical filing can change even a settled closed period, so every
+    // period response uses the same bounded cache window.
+    res.set('Cache-Control', 'public, max-age=300');
     res.json({
       id: period.id,
       kind: period.kind,

@@ -153,6 +153,11 @@ function periodIdFor(date, kind) {
   return `${isoYear}-W${pad(week)}`;
 }
 
+function periodIdsForDate(date) {
+  if (!parseDate(date)) return [];
+  return ['week', 'month', 'quarter', 'year'].map(kind => periodIdFor(date, kind));
+}
+
 // Whether a date falls inside a period. ISO dates sort lexicographically, which
 // is the cheapest correct comparison there is.
 function isWithin(date, range) {
@@ -189,6 +194,7 @@ module.exports = {
   daysInMonth,
   parsePeriodId,
   periodIdFor,
+  periodIdsForDate,
   isWithin,
   daysBetween,
   istDate,

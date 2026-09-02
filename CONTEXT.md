@@ -15,8 +15,8 @@ is a `$group`. Addressed by its IST date (`2026-08-27`) or by the sentinel
 `latest`.
 
 **Date key** — `_dateKey`, `YYYY-MM-DD` in IST. The edition an article was first
-filed into. Set once on insert and never rewritten, so a re-push updates a story
-without moving it to another day.
+filed into, chosen explicitly by the publisher or defaulted to the current IST
+date. Set once on insert, so a re-push updates a story without moving it.
 
 **Article** — one piece in one edition. Its **identity** is derived from its
 content and its date key, so an id names fixed content for life. Two stories
@@ -48,8 +48,9 @@ depend on that or on the `TZ` variable.
 whether or not any paper was published inside it.
 
 **Open period** — one whose last day is today or in the future; still
-accumulating. **Closed period** — one whose last day has passed. A closed period
-can never change, because a new article can never be given a past date key.
+accumulating. **Closed period** — one whose last day has passed. It is normally
+settled but can change when the publisher files a late article into a historical
+edition.
 
 **Empty period** — a valid, in-range period containing no editions. The
 commonest answer, not a failure. Distinct from a period outside the year bounds,
@@ -61,9 +62,9 @@ which does not resolve at all.
 per-category counts, and the day-by-day timeline. Always present, always
 truthful, computable retroactively.
 
-**Prose** — the synthesised half: a written retrospective generated once from
-the period's headlines when a closed period is first viewed, then stored for
-ever. Its three parts are the **lede**, one paragraph **per category**, and the
+**Prose** — the synthesised half: a written retrospective generated from a
+closed period's headlines and retained until that period receives a late filing.
+Its three parts are the **lede**, one paragraph **per category**, and the
 **fold-in line** covering categories too thin to earn a paragraph.
 
 **Ranking** — prose *is* the ranking. A period view has no headline list and
@@ -79,8 +80,9 @@ token and the two version axes and nothing joinable to a person.
 running on top of it. Two installs on the same `appVersion` can be running
 different JS.
 
-**Edition birth** — the first time a date key is seen. The one occasion a
-notification is sent; a same-day re-push is not a birth.
+**Edition birth** — the first time a date key is seen. A birth for the current
+IST date is the one occasion a notification is sent; a historical birth and a
+same-day re-push are silent.
 
 ## Availability
 
