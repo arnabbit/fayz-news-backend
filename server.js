@@ -6,16 +6,14 @@ const { computeArticleId, qualifyArticleId, normalizeHeadline } = require('./art
 const { resolveEditionDate: resolveIngestionEditionDate } = require('./editionDate');
 const { slugifyCategory, editionCategories } = require('./categories');
 const { DEK_CAP } = require('./dek');
-const { toFeedItem, toArticle, FEED_PROJECTION } = require('./wire');
+const { toFeedItem, toArticle, FEED_PROJECTION, toPeriod, storyArticleIds } = require('./wire');
 const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 const { searchQuery, searchLimit } = require('./search');
-const { parsePeriodId, periodIdsForDate, daysBetween, istDate } = require('./period');
-const {
-  TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS,
-  resolveModel, buildPrompt, parseModelReply, validateProse,
-} = require('./prose');
-const { categoryName } = require('./categories');
+const { parsePeriodId, istDate } = require('./period');
+const { TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS, resolveModel } = require('./model');
+const { STORIES, catchUp, createStoryQueue, readStoryState } = require('./storyCatchUp');
+const { storyStatus } = require('./periodStory');
 
 const app = express();
 app.use(cors());
@@ -31,11 +29,11 @@ const DB_NAME = process.env.MONGODB_DB || 'fayznews';
 // an unauthenticated push and logs it, so shipping the backend can never stop
 // the pipeline; flip it to true once the extension sends the header.
 const CHRONICLE_KEY = process.env.CHRONICLE_KEY || '';
-// The generator's key and model, both from the environment, exactly as the
+// The model's key and name, both from the environment, exactly as the
 // instagram-news-summarizer extension already does it. With the key unset,
-// generation does not run and does not throw: the period keeps its "pending"
-// status and its skeleton renders, so a backend deployed without the key is
-// degraded and never broken. Neither value is ever logged.
+// no story run happens and nothing throws: the period's skeleton still
+// renders, so a backend deployed without the key is degraded and never
+// broken. Neither value is ever logged.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_MODEL = resolveModel(process.env.OPENROUTER_MODEL);
 const REQUIRE_PUSH_KEY = String(process.env.REQUIRE_PUSH_KEY || '').toLowerCase() === 'true';
@@ -100,17 +98,33 @@ async function connectDB() {
       err.message
     );
   }
-  // Makes the prose claim atomic: a period that already holds a summary cannot
-  // be claimed for a second generation.
+  // One story document per period. Every store is guarded on it, so a second
+  // document for the same period would split its story in two.
   try {
-    await db.collection('periodProse').createIndex(
+    await db.collection(STORIES).createIndex(
       { periodId: 1 },
       { unique: true, name: 'periodId_unique' }
     );
   } catch (err) {
     console.error(
-      'WARNING: could not create the unique index on `periodProse.periodId` — '
-      + 'duplicate summaries are possible until this is resolved.',
+      'WARNING: could not create the unique index on `periodStories.periodId` — '
+      + 'a period story can be split until this is resolved.',
+      err.message
+    );
+  }
+  // Threads. Grouping looks for the oldest ungrouped edition, then for the
+  // threads active before it, then for their latest headlines.
+  await db.collection('articles').createIndex({ _threadId: 1, _dateKey: 1 });
+  await db.collection('storyThreads').createIndex({ lastDate: 1 });
+  try {
+    await db.collection('storyThreads').createIndex(
+      { threadId: 1 },
+      { unique: true, name: 'threadId_unique' }
+    );
+  } catch (err) {
+    console.error(
+      'WARNING: could not create the unique index on `storyThreads.threadId` — '
+      + 'duplicate threads are possible until this is resolved.',
       err.message
     );
   }
@@ -423,14 +437,9 @@ app.post('/api/articles', requireKey, async (req, res) => {
       { ordered: false }
     );
 
-    // A late filing changes every retrospective containing that edition. Drop
-    // the stored prose so the existing lazy generator can rebuild it from the
-    // new headline set. A retry is safe: deleting an absent summary is a no-op.
-    if (edition.historical) {
-      await db.collection('periodProse').deleteMany({
-        periodId: { $in: periodIdsForDate(dateKey) }
-      });
-    }
+    // Nothing about the period stories happens here: no model call, no story
+    // write. A late filing is noticed by its `_createdAt` the next time a
+    // period containing it is opened.
 
     res.json({ ok: true, date, edition: dateKey, count: uniqueDocs.length });
 
@@ -756,15 +765,13 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
   }
 });
 
-// ---- the period retrospective ----
+// ---- the period story ----
 //
-// Generated lazily on first view of a CLOSED period. Explicit historical
-// filings invalidate the four affected period documents, so a later view can
-// regenerate prose from the new headline set. Attempts remain capped per
-// generation lifecycle to bound spend when a model repeatedly fails.
-//
-// Prose lives in its own collection because `articles` has spent its one text
-// index slot on search (see docs/adr/0001).
+// Grown only when a period is opened, after the response, one run per
+// unprocessed edition (see storyCatchUp.js). Nothing runs on POST
+// /api/articles. Stories live in their own collection, `periodStories`,
+// because `articles` has spent its one text index slot on search (see
+// docs/adr/0001).
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 
 async function askOpenRouter(prompt) {
@@ -790,80 +797,41 @@ async function askOpenRouter(prompt) {
   const payload = await response.json();
   const reply = payload && payload.choices && payload.choices[0]
     && payload.choices[0].message && payload.choices[0].message.content;
-  // An empty completion is a failure, not an empty summary.
+  // An empty completion is a failure, not an empty answer.
   if (typeof reply !== 'string' || !reply.trim()) throw new Error('OpenRouter returned no content');
   return reply;
 }
 
-// Three tries and the period is left alone. Without a cap, a period the model
-// cannot summarise — a shape it keeps getting wrong, a prompt that trips a
-// filter — is retried on every single view for ever, which is the one way the
-// "immutability is the rate limit" argument in docs/adr/0003 can be defeated.
-const MAX_PROSE_ATTEMPTS = 3;
+// One in-process queue runs every story pass, and the grouping inside it, one
+// at a time. A pass that fails has its attempt counted and is tried again on a
+// later open.
+const storyQueue = createStoryQueue((periodId, err) => {
+  console.error(`growing the story for ${periodId} failed:`, err.message);
+});
 
-// Claims the right to generate. Backed by the unique index on `periodId`, so a
-// document that already holds prose makes the upsert collide rather than start a
-// second generation. Returns false when the period is done, being done, or has
-// spent its attempts.
-//
-// This bounds spend rather than serialising perfectly: two requests arriving in
-// the same instant can both claim, because the counter is incremented rather
-// than leased. Bounded double-spend on a rare race is a fair trade against a
-// lease that has to expire correctly, given generation happens once per period
-// for the life of the archive.
-async function claimProse(periodId) {
-  try {
-    const result = await db.collection('periodProse').updateOne(
-      { periodId, prose: { $exists: false }, attempts: { $lt: MAX_PROSE_ATTEMPTS } },
-      { $inc: { attempts: 1 }, $set: { lastAttemptAt: new Date() }, $setOnInsert: { periodId } },
-      { upsert: true }
-    );
-    return result.upsertedCount === 1 || result.modifiedCount === 1;
-  } catch (err) {
-    // Duplicate key: another writer holds this period, or it is already written.
-    if (err.code === 11000) return false;
-    throw err;
-  }
-}
-
-async function generateProse(period, categories) {
-  if (!OPENROUTER_API_KEY) return null;
-
-  // Headlines only, never bodies. A year reads its own headlines rather than
-  // four quarter summaries, so summarisation error does not compound.
-  const rows = await db.collection('articles')
-    .find(
-      { ...VISIBLE, _dateKey: { $gte: period.range.from, $lte: period.range.to } },
-      { projection: { headline: 1, category: 1, _id: 0 } }
-    )
-    .toArray();
-  const headlinesBySlug = {};
-  for (const row of rows) {
-    (headlinesBySlug[row.category] = headlinesBySlug[row.category] || []).push(row.headline);
-  }
-
-  const reply = await askOpenRouter(buildPrompt(period, categories, headlinesBySlug));
-  // Validated before storage. The app parses defensively as well, but a
-  // malformed generation should never reach the collection in the first place.
-  const prose = validateProse(parseModelReply(reply), categories);
-  if (!prose) throw new Error('OpenRouter returned nothing that fits the shape');
-
-  // Filtered on prose being absent, so the first store wins and any racer's
-  // work is discarded rather than overwriting a summary a reader may already
-  // have been served.
-  await db.collection('periodProse').updateOne(
-    { periodId: period.id, prose: { $exists: false } },
-    { $set: { prose, model: OPENROUTER_MODEL, generatedAt: new Date() } }
-  );
-  const stored = await db.collection('periodProse').findOne({ periodId: period.id });
-  return stored && stored.prose ? stored.prose : prose;
+function queueStory(period) {
+  // With the key unset nothing is queued, read or called.
+  if (!OPENROUTER_API_KEY) return;
+  storyQueue.enqueue(period.id, async () => {
+    const runs = await catchUp({
+      db,
+      ask: askOpenRouter,
+      enabled: true,
+      model: OPENROUTER_MODEL,
+      today: () => istDate(Date.now()),
+      now: () => new Date(),
+    }, period);
+    if (runs.length) {
+      console.log(`story ${period.id}: ${runs.map(r => `${r.date} ${r.outcome}`).join(', ')}`);
+    }
+  });
 }
 
 // ---- GET /api/v2/periods/:id — a week, month, quarter or year at a glance ----
 //
 // The skeleton is a deterministic aggregate: always present, always truthful,
 // computable retroactively. That is what lets the screen render unconditionally
-// and treat a written summary as a bonus rather than as the content.
+// and never wait for the period story.
 app.get('/api/v2/periods/:id', async (req, res) => {
   try {
     const period = parsePeriodId(req.params.id);
@@ -889,74 +857,40 @@ app.get('/api/v2/periods/:id', async (req, res) => {
       },
     ]).toArray();
 
-    const byDay = new Map((facets.byDay || []).map(row => [row._id, row.count]));
-    const articleCount = [...byDay.values()].reduce((sum, n) => sum + n, 0);
+    const articleCount = (facets.byDay || []).reduce((sum, row) => sum + row.count, 0);
 
-    // One entry per day in the range, including the days with nothing — so the
-    // timeline draws a day with no edition as a tick rather than as a gap.
-    const timeline = daysBetween(period.range).map(date => ({
-      date,
-      count: byDay.get(date) || 0,
-    }));
+    // The stored story, and whether a run is due for it. Reads only: the
+    // runs themselves happen after the response.
+    const { story, due } = await readStoryState(db, period, istDate(Date.now()));
+    const status = storyStatus({
+      articleCount,
+      due,
+      queued: storyQueue.isQueued(period.id),
+      enabled: Boolean(OPENROUTER_API_KEY),
+    });
 
-    const categories = (facets.byCategory || [])
-      .map(row => ({ slug: row._id, name: categoryName(row._id), count: row.count }))
-      .sort((a, b) => b.count - a.count || a.slug.localeCompare(b.slug));
+    // Hidden is checked now, not when the entry was written: an article
+    // hidden after its section froze must not be linked from it.
+    const cited = storyArticleIds(story);
+    const visibleIds = new Set(cited.length
+      ? await db.collection('articles').distinct('id', { ...VISIBLE, id: { $in: cited } })
+      : []);
 
-    // A period is open until its last day is behind us, in the paper's own
-    // timezone. An open period is still accumulating, so there is nothing to
-    // summarise yet; an empty one has nothing to summarise at all.
-    const open = to >= istDate(Date.now());
-    let proseStatus = articleCount === 0 && !open ? 'none' : 'pending';
-    let prose = null;
-    const summarisable = !open && articleCount > 0;
-
-    if (summarisable) {
-      const stored = await db.collection('periodProse').findOne({ periodId: period.id });
-      // Every later view reads the stored copy and makes no model call.
-      if (stored && stored.prose) {
-        prose = stored.prose;
-        proseStatus = 'ready';
-      }
-    }
-
-    // **The response never waits on the model.** docs/adr/0003 rejects "waiting
-    // for the prose before serving anything" in as many words, and the first
+    // **The response never waits on the model.** docs/adr/0003 and 0005 reject
+    // waiting for generated text before serving anything, and the first
     // implementation did exactly that — awaiting a call with a 90-second
     // timeout, so a cold first view of a closed period could time out at the
     // gateway and return no skeleton at all. The skeleton is the half that is
-    // always true; it goes out now and the summary arrives on a later view.
+    // always true; it goes out now and the story grows on later views.
     //
     // Historical filing can change even a settled closed period, so every
     // period response uses the same bounded cache window.
     res.set('Cache-Control', 'public, max-age=300');
-    res.json({
-      id: period.id,
-      kind: period.kind,
-      range: period.range,
-      editionCount: byDay.size,
-      articleCount,
-      categories,
-      timeline,
-      prose,
-      proseStatus,
-    });
+    res.json(toPeriod({ period, facets, story, visibleIds, storyStatus: status }));
 
-    // After the response, and unable to fail it. The claim is what stops this
-    // being one model call per view: it is backed by a unique index, counts its
-    // attempts, and gives up after three.
-    if (summarisable && proseStatus === 'pending' && OPENROUTER_API_KEY) {
-      claimProse(period.id)
-        .then(claimed => (claimed ? generateProse(period, categories) : null))
-        .then(written => {
-          if (written) console.log(`wrote prose for ${period.id}`);
-        })
-        .catch(err => {
-          // The attempt is already recorded, so a period that keeps failing
-          // stops being tried rather than being retried for ever.
-          console.error(`generating prose for ${period.id} failed:`, err.message);
-        });
-    }
+    // After the response, and unable to fail it: queued, never awaited. The
+    // pass decides for itself whether any run is due.
+    if (articleCount > 0) queueStory(period);
   } catch (err) {
     console.error('GET /api/v2/periods/:id error:', err);
     fail(res, 500, 'internal', err.message);

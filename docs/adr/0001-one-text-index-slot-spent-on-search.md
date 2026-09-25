@@ -76,8 +76,9 @@ this before adding an index to `articles`:
    is impossible** without dropping and rebuilding this index.
 2. **Nothing else on `articles` can ever have its own text index.** Anything
    future that wants one must share this index or live in its own collection.
-   Period prose is the likeliest candidate, and does live in its own collection
-   (`periodProse`) for exactly this reason.
+   The period story is the likeliest candidate, and lives in its own
+   collection (`periodStories`) for exactly this reason. It replaced period
+   prose, which lived in `periodProse` for the same reason (ADR 0005).
 
 `$text` combined with `sort: {_id: -1}` cannot use an index for the sort, so
 Mongo sorts in memory. Verified rather than assumed: the limit is 32 MB against

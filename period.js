@@ -177,6 +177,13 @@ function daysBetween(range) {
   return days;
 }
 
+// A date moved by whole days, across months and years. Arithmetic on the
+// digits, never a timezone conversion.
+function addDays(date, days) {
+  const [y, m, d] = date.split('-').map(Number);
+  return isoDate(utc(y, m, d) + days * DAY_MS);
+}
+
 // IST is UTC+5:30 with no daylight saving, ever. A fixed offset is arithmetic,
 // not the timezone conversion the house rule forbids — what that rule bans is
 // reading a *date string* back through the host's zone. `now` is a parameter so
@@ -197,5 +204,6 @@ module.exports = {
   periodIdsForDate,
   isWithin,
   daysBetween,
+  addDays,
   istDate,
 };

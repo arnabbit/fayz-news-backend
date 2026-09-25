@@ -1,6 +1,16 @@
 # 0003 — Periods: the skeleton is always served, prose is generated lazily
 
-**Status:** accepted (F11, F12, F14); historical invalidation amended by ADR 0004
+**Status:** superseded for prose by ADR 0005; the skeleton half stands
+(F11, F12, F14). Historical invalidation amended by ADR 0004, then removed by
+ADR 0005.
+
+> **Prose no longer exists.** ADR 0005 replaced it with the period story:
+> `prose` and `proseStatus` are off the wire, and `prose.js`, the `periodProse`
+> collection's use, the generation claim and the invalidation on write are gone.
+> Everything below about prose is history. What still holds: the skeleton and
+> its 404 rules, the response never waiting on the model, the five-minute cache,
+> no key meaning no call and no throw, and `period.js` held to the app by
+> `test/period-agreement.json`.
 
 ## Decision
 

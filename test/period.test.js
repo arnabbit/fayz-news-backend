@@ -6,6 +6,7 @@ const {
   periodIdsForDate,
   isWithin,
   daysBetween,
+  addDays,
   istDate,
 } = require('../period');
 const AGREEMENT = require('./period-agreement.json');
@@ -173,6 +174,13 @@ test('day counts are right across a leap February and a whole year', () => {
 test('a single-day range is one day, and a malformed one is none', () => {
   assert.deepEqual(daysBetween({ from: '2026-08-24', to: '2026-08-24' }), ['2026-08-24']);
   assert.deepEqual(daysBetween({ from: 'nonsense', to: '2026-08-24' }), []);
+});
+
+test('adding days is calendar arithmetic, across months and years', () => {
+  assert.equal(addDays('2026-09-20', 3), '2026-09-23');
+  assert.equal(addDays('2026-09-29', 3), '2026-10-02');
+  assert.equal(addDays('2026-12-30', 3), '2027-01-02');
+  assert.equal(addDays('2028-02-28', 1), '2028-02-29');
 });
 
 // The two implementations must agree, or a period looks different depending on
