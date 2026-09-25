@@ -107,7 +107,7 @@ async function connectDB() {
     );
   } catch (err) {
     console.error(
-      'WARNING: could not create the unique index on `periodStories.periodId` — '
+      'WARNING: could not create the unique index on `periodStoriesV2.periodId` — '
       + 'a period story can be split until this is resolved.',
       err.message
     );
@@ -769,7 +769,7 @@ app.patch('/api/v2/articles/:id', requireKey, async (req, res) => {
 //
 // Grown only when a period is opened, after the response, one run per
 // unprocessed edition (see storyCatchUp.js). Nothing runs on POST
-// /api/articles. Stories live in their own collection, `periodStories`,
+// /api/articles. Stories live in their own collection, `periodStoriesV2`,
 // because `articles` has spent its one text index slot on search (see
 // docs/adr/0001).
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
@@ -869,8 +869,8 @@ app.get('/api/v2/periods/:id', async (req, res) => {
       enabled: Boolean(OPENROUTER_API_KEY),
     });
 
-    // Hidden is checked now, not when the entry was written: an article
-    // hidden after its section froze must not be linked from it.
+    // Hidden is checked now, not when the part was written: an article
+    // hidden after its part froze must not be linked from it.
     const cited = storyArticleIds(story);
     const visibleIds = new Set(cited.length
       ? await db.collection('articles').distinct('id', { ...VISIBLE, id: { $in: cited } })

@@ -70,32 +70,40 @@ Every article belongs to exactly one.
 **Important story** — a thread that passes four checks inside a given period:
 **verified**, **material change**, **consequences** and **lasting**. Judged over
 the period's evidence to date, never within one day, and against that period's
-own range, so a story can be important in its week and not in its year.
+own range, so a story can be important in its week and not in its year. Lasting
+needs the thread on a minimum number of the period's own editions: week 2,
+month 3, quarter 5, year 10.
 
-**Period story** — the growing article for one period, telling only its
-important stories. It grows at the end, one section at a time; what is already
-written stays as written. The screen never waits for it.
+**Period story** — the period's important stories, as a ranked list. It is
+re-ranked on every run; what is already written stays as written. The screen
+never waits for it.
 
-**Section** — one dated part of a period story, written by one run for one
-edition date. Frozen once its date has passed; only a section dated today can
-still be rewritten. A run that finds nothing important writes no section.
+**Story** — one thread in the ranked list: a headline, its backstory, and its
+dated parts after it.
 
-**Entry** — one item in a section. **New**: an important story told for the
-first time, from its start in the period. **Update**: only what is new in an
-admitted story since its last entry. **Correction**: what an earlier entry got
-wrong, appended; the earlier text is not edited.
+**Part** — one dated piece of a story. **Backstory**: the story told from its
+start in the period, written on the day it is admitted. **Update**: only what
+is new since the story's last part. **Correction**: what an earlier part got
+wrong; the earlier text is not edited. Parts are append-only: a new part is
+added at the end, at most one per story per day, and only a part dated today
+can still be rewritten.
 
-**Admitted** — a thread that has a new entry in a period story. Only an
-admitted thread gets updates or corrections. Admission is per period.
+**Admitted** — a thread that has a stored story in a period. Only an admitted
+thread that is ranked gets updates or corrections. Admission is per period and
+happens once: a story that comes back gets no second backstory.
 
 **Grace window** — the 3 days after a period's last day. Editions inside it are
 evidence for the period and can still admit stories that happened inside it;
-they are never cited, and a run inside it only admits.
+they are never cited, and a run inside it only re-ranks and admits.
 
-**Ranking** — the story order is the ranking. Sections read by date, and entries
-within a section in the editor's order of importance. A period view has no
-headline list and nothing re-sorts the story downstream: the order it is stored
-in is the order it means.
+**Budget** — the most stories the ranked list can hold at one time: week 5,
+month 20, quarter 60, year 240. It is a hard limit and a ceiling, not a target.
+
+**Ranking** — the order of the stories, most important first. The stories are
+re-ranked on every run, so a story can move up, move down or drop out of the
+list. A story that drops out keeps its text, and if it comes back it resumes
+from where it stopped. Parts read in date order. Nothing re-sorts either list
+downstream: the order it is stored in is the order it means.
 
 ## Registration and sending
 

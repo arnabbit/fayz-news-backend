@@ -1,8 +1,13 @@
 # 0005 — The period story: importance judged over the period, grown append-only
 
-**Status:** accepted (S01–S06). Supersedes ADR 0003 for prose; its skeleton
-half stands. Amends ADR 0004: a late filing is new evidence and invalidates
-nothing.
+**Status:** accepted (S01–S06); **superseded in part by ADR 0006**, which
+replaces the dated sections and entries with a ranked list of stories. What
+still holds here: the definition and the four checks, threads, importance
+judged per period (D1, D4), the grace window (D5), the source half of
+"verified" (D6), corrections appended (D7), prose removed (D9), generation on
+open (D10), three attempts, the audit fields, no key, and the amendment to
+ADR 0004 on late filings. Supersedes ADR 0003 for prose; its skeleton half
+stands. Amends ADR 0004: a late filing is new evidence and invalidates nothing.
 
 ## Context
 

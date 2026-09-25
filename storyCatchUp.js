@@ -1,5 +1,5 @@
-// Grows a period's story: one run per due date, oldest first, each appending
-// at most one section. The rules live in periodStory.js (progress and guards),
+// Grows a period's story: one run per due date, oldest first, each re-ranking
+// the period's stories and adding at most one part to each. The rules live in periodStory.js (progress and guards),
 // threadGrouping.js (threads) and story.js (the editor); this is the part that
 // reads, calls and writes. The database, the model call and the clock are
 // passed in, so the whole run is testable without any of them.
@@ -10,7 +10,7 @@
 
 const { parseModelReply } = require('./model');
 const { groupThrough } = require('./threadGrouping');
-const { buildEvidence, buildStoryPrompt, validateSection } = require('./story');
+const { buildEvidence, buildStoryPrompt, validateRanking } = require('./story');
 const {
   MAX_ATTEMPTS,
   OUTCOME,
@@ -25,7 +25,9 @@ const {
   emptyStory,
 } = require('./periodStory');
 
-const STORIES = 'periodStories';
+// The ranked-story documents. The day-by-day `periodStories` documents are
+// never read: every period is rebuilt from scratch in its own collection.
+const STORIES = 'periodStoriesV2';
 
 // A bound on one pass, far above a year's editions. It only stops a loop that
 // something unforeseen keeps from making progress.
@@ -112,9 +114,9 @@ async function runOnce(deps, period, story, d, today, late) {
     // Three attempts spent: the date is skipped, and its articles stay
     // evidence for every later run.
     const rows = await readRows();
-    const skip = storeUpdate({ story, date: d, today, section: null, consumed: newestCreatedAt(rows), model, now: deps.now(), late });
-    const result = await stories.updateOne(skip.filter, skip.update);
-    return result.matchedCount ? OUTCOME.SKIPPED : OUTCOME.LOST;
+    const skip = storeUpdate({ story, date: d, today, result: null, consumed: newestCreatedAt(rows), model, now: deps.now(), late });
+    const skipped = await stories.updateOne(skip.filter, skip.update);
+    return skipped.matchedCount ? OUTCOME.SKIPPED : OUTCOME.LOST;
   }
   const claimed = await stories.updateOne(claim.filter, claim.update);
   if (!claimed.matchedCount) return OUTCOME.LOST;
@@ -124,7 +126,7 @@ async function runOnce(deps, period, story, d, today, late) {
   if (deps.group) await deps.group(d, lastAttempt);
   else await groupThrough({ db, ask: lastAttempt ? emptyOnFailure(ask) : ask }, d);
 
-  // Step 2: the evidence up to `d`.
+  // Step 2: the candidates up to `d`.
   const rows = await readRows();
   const read = withoutLateFilings(rows, late, d, today);
   const threadIds = [...new Set(read.map(r => r._threadId).filter(Boolean))];
@@ -135,21 +137,26 @@ async function runOnce(deps, period, story, d, today, late) {
     : [];
   const evidence = buildEvidence(period, d, threads, read, story);
 
-  // Step 3: the editor. No evidence, no call.
-  let section = null;
+  // Step 3: the editor. No candidate, no call, and the stored ranking stands.
+  let result = null;
   if (evidence.length) {
     const reply = await ask(buildStoryPrompt(period, d, evidence, story));
-    // Unparseable is a failed attempt. A parsed reply with nothing that
-    // survives validation is a normal answer: no section.
-    const parsed = parseModelReply(reply);
-    if (!parsed || !Array.isArray(parsed.entries)) throw new Error('the editor returned nothing that parses');
-    section = validateSection(parsed, period, d, evidence, story);
+    // Unparseable is a failed attempt. A parsed ranking with nothing that
+    // survives validation is a normal answer: nothing ranked.
+    result = validateRanking(parseModelReply(reply), period, d, evidence, story);
+    if (!result) throw new Error('the editor returned nothing that parses');
+    // Every ranked story gone at once is a glitch, not a judgement: a failed
+    // attempt, so the stored ranking stands. With nothing ranked yet, an empty
+    // ranking is a normal answer.
+    if (!result.ranking.length && (story.ranking || []).length) {
+      throw new Error('the editor ranked nothing over a stored ranking');
+    }
   }
 
   // Step 4: store, guarded.
-  const store = storeUpdate({ story, date: d, today, section, consumed: newestCreatedAt(rows), model, now: deps.now(), late });
-  const result = await stories.updateOne(store.filter, store.update);
-  return result.matchedCount ? store.outcome : OUTCOME.LOST;
+  const store = storeUpdate({ story, date: d, today, result, consumed: newestCreatedAt(rows), model, now: deps.now(), late });
+  const stored = await stories.updateOne(store.filter, store.update);
+  return stored.matchedCount ? store.outcome : OUTCOME.LOST;
 }
 
 // Brings one period's story up to date. Returns the runs it made, in order,

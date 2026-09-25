@@ -53,34 +53,42 @@ const FEED_PROJECTION = {
 
 // ---- the period ----
 
-// Every article id the stored story cites, once. The route asks Mongo which
+// The stored stories in served order: the ranking, each id once, and only ids
+// that have a story. A story that dropped out of the ranking is not served.
+function rankedStories(story) {
+  const byThread = new Map(list(story && story.stories)
+    .filter(s => s && typeof s.threadId === 'string')
+    .map(s => [s.threadId, s]));
+  return [...new Set(list(story && story.ranking))].filter(id => byThread.has(id)).map(id => byThread.get(id));
+}
+
+// Every article id the served stories cite, once. The route asks Mongo which
 // of these are still visible.
 function storyArticleIds(story) {
   const ids = new Set();
-  for (const section of list(story && story.sections)) {
-    for (const entry of list(section && section.entries)) {
-      for (const id of list(entry && entry.articleIds)) ids.add(id);
+  for (const s of rankedStories(story)) {
+    for (const part of list(s.parts)) {
+      for (const id of list(part && part.articleIds)) ids.add(id);
     }
   }
   return [...ids];
 }
 
-// The stored story as the app reads it. Sections and entries keep their
-// stored order. `why`, `verification`, `basis`, `writtenAt` and `model` stay
-// in Mongo for audit. An id not in `visibleIds` (hidden, or gone) is dropped;
-// the entry stays, because its text was written and frozen and the ids only
-// link out.
+// The stored story as the app reads it: the ranked stories in ranking order,
+// each story's parts in stored order. `why`, `verification`, `basis`,
+// `writtenAt` and `model` stay in Mongo for audit. An id not in
+// `visibleIds` (hidden, or gone) is dropped; the part stays, because its text
+// was written and frozen and the ids only link out.
 function toStory(story, visibleIds) {
   return {
-    sections: list(story && story.sections).map(section => ({
-      date: section.date,
-      entries: list(section.entries).map(e => ({
-        threadId: e.threadId,
-        kind: e.kind,
-        headline: e.headline,
-        paragraphs: list(e.paragraphs),
-        articleIds: list(e.articleIds).filter(id => visibleIds.has(id)),
-        continuesFrom: e.continuesFrom || null,
+    stories: rankedStories(story).map(s => ({
+      threadId: s.threadId,
+      headline: s.headline,
+      parts: list(s.parts).map(p => ({
+        date: p.date,
+        kind: p.kind,
+        paragraphs: list(p.paragraphs),
+        articleIds: list(p.articleIds).filter(id => visibleIds.has(id)),
       })),
     })),
   };

@@ -2,9 +2,14 @@
 // updates that store a run. Pure: no database, no network. storyCatchUp.js
 // reads the rows, makes the calls and applies these updates.
 //
-//   periodStories { periodId (unique), sections: [{ date, entries[], writtenAt, model }],
-//                   admitted: [threadId], throughDate, seenUpTo, attempts: { <date>: n },
-//                   late: [{ through, after }] | null }
+//   periodStoriesV2 { periodId (unique),
+//                     stories: [{ threadId, headline, parts: [{ date, kind, paragraphs, articleIds,
+//                                                               why, verification?, basis?, writtenAt, model }] }],
+//                     ranking: [threadId], throughDate, seenUpTo, attempts: { <date>: n },
+//                     late: [{ through, after }] | null }
+//   stories       every story ever admitted, in the order admitted. One that
+//                 drops out of the ranking stays here, text and all
+//   ranking       the served order, at most the budget, set by the last run
 //   throughDate   the last run date that has completed
 //   seenUpTo      the newest articles._createdAt the last run read. A later
 //                 filing into a date already run is how a late article is seen
@@ -15,12 +20,14 @@
 //                 the run dated today that reads them
 //
 // The guard is the contract. A store matches only the throughDate and the
-// section count it read, so a retried or doubled run cannot add twice. Only
-// the section dated today may be replaced; an earlier one is never addressed.
+// story count it read, so a retried or doubled run cannot add twice. Text is
+// append-only: a run adds at most one part per story, at its end. Only the
+// parts and the ranking of a run dated today may be replaced; a part dated
+// before today is never changed or removed.
 //
 // Dates are IST `YYYY-MM-DD` strings and compare as strings.
 
-const { admittedThreads } = require('./story');
+const { storySoFar } = require('./story');
 const { addDays } = require('./period');
 
 // Editions this many days after a period's last day still count for it.
@@ -29,11 +36,13 @@ const GRACE_DAYS = 3;
 // reach later runs as evidence.
 const MAX_ATTEMPTS = 3;
 
-// What one run did: stored a section after the last one, stored one over
-// today's, stored none, spent its attempts, or lost the race to another writer.
+// What one run did: added parts after the ones written, replaced today's
+// parts and ranking, changed the ranking only, changed nothing, spent its
+// attempts, or lost the race to another writer.
 const OUTCOME = Object.freeze({
   APPENDED: 'appended',
   REPLACED: 'replaced',
+  RANKED: 'ranked',
   NONE: 'none',
   SKIPPED: 'skipped',
   LOST: 'lost',
@@ -75,10 +84,16 @@ function editionFacts(rows) {
   return [...byDate.keys()].sort().map(date => ({ date, newest: byDate.get(date) }));
 }
 
-const lastSection = story => {
-  const sections = (story && story.sections) || [];
-  return sections.length ? sections[sections.length - 1] : null;
-};
+// The date of the newest part written, or null when nothing is.
+function lastPartDate(story) {
+  let last = null;
+  for (const s of (story && story.stories) || []) {
+    for (const part of (s && s.parts) || []) {
+      if (part && typeof part.date === 'string') last = maxDate(last, part.date);
+    }
+  }
+  return last;
+}
 
 function editionsInWindow(period, today, editions) {
   const window = storyWindow(period, today);
@@ -117,7 +132,7 @@ function lateFilings(period, today, editions, story) {
 
 // The rows a run for `d` reads. An edition run before today leaves the late
 // filings out, so they are read once, by the run dated today, and never go
-// into a section dated in the past. A mark with no `after` has no watermark
+// into a part dated in the past. A mark with no `after` has no watermark
 // to tell a late row from an old one, so it leaves nothing out; the run dated
 // today is still due.
 function withoutLateFilings(rows, late, d, today) {
@@ -154,7 +169,7 @@ function guardFilter(story) {
   return {
     periodId: story.periodId,
     throughDate: story.throughDate || null,
-    sections: { $size: ((story && story.sections) || []).length },
+    stories: { $size: ((story && story.stories) || []).length },
   };
 }
 
@@ -167,35 +182,66 @@ function claimUpdate(story, d) {
   return { filter: guardFilter(story), update: { $inc: { [`attempts.${d}`]: 1 } }, attempt: done + 1 };
 }
 
+const sameList = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
 // The update that stores the run for date `d`, whatever it found.
 //
-//  - `section` null (nothing qualified, or the date was skipped): throughDate
-//    and seenUpTo still advance.
-//  - A section after the last one is appended.
-//  - A section dated today, when the last section is dated today, replaces it.
-//  - Any other section is not stored. A section dated before today is frozen.
+//  - `result` null (no candidates, or the date was skipped): nothing is
+//    written, and throughDate and seenUpTo still advance.
+//  - Otherwise the stories are the ones written before `d` (storySoFar), each
+//    backstory a new story at the end and each update a part at the end of its
+//    story, all dated `d`; and the ranking is the result's.
+//  - A run dated today over parts or a ranking already dated today replaces
+//    them, and only them. A story admitted today that the new ranking drops
+//    goes with its backstory: it was never written.
+//  - A run for a date that has parts dated on or after it, and is not today,
+//    stores nothing. A part dated before today is frozen.
 //
-// `consumed` is the newest _createdAt the run read. `admitted` is recomputed
-// from the sections as they will be, so a replaced section cannot leave a
-// thread admitted that no longer has its `new` entry.
+// Parts are never edited. A story that drops out of the ranking keeps its
+// parts, and if it comes back its next part is added after them.
 //
-// `late` is lateFilings as the run read it. An edition run before today
-// stores it, so the run dated today stays due after seenUpTo has moved past
-// the late filings. The run dated today clears it.
-function storeUpdate({ story, date: d, today, section, consumed, model, now, late }) {
-  const sections = (story && story.sections) || [];
-  const last = lastSection(story);
+// `consumed` is the newest _createdAt the run read. `late` is lateFilings as
+// the run read it. An edition run before today stores it, so the run dated
+// today stays due after seenUpTo has moved past the late filings. The run
+// dated today clears it.
+function storeUpdate({ story, date: d, today, result, consumed, model, now, late }) {
+  const ranking = (story && story.ranking) || [];
   const filter = guardFilter(story);
+  const last = lastPartDate(story);
+  const writable = !last || d > last || d === today;
 
   let outcome = OUTCOME.NONE;
-  let next = sections;
-  const stored = section && { date: d, entries: section.entries, writtenAt: now, model };
-  if (stored && (!last || d > last.date)) {
-    outcome = OUTCOME.APPENDED;
-    next = [...sections, stored];
-  } else if (stored && last.date === d && d === today) {
-    outcome = OUTCOME.REPLACED;
-    next = [...sections.slice(0, -1), stored];
+  let next = null;
+  let nextRanking = null;
+  if (result && writable) {
+    const stamp = part => ({ date: d, ...part, writtenAt: now, model });
+    const base = storySoFar(story, d).stories;
+    next = base.map(s => ({ ...s, parts: [...s.parts] }));
+    const byThread = new Map(next.map(s => [s.threadId, s]));
+    let added = 0;
+    for (const b of result.backstories || []) {
+      if (byThread.has(b.threadId)) continue;
+      const fresh = { threadId: b.threadId, headline: b.headline, parts: [stamp(b.part)] };
+      next.push(fresh);
+      byThread.set(b.threadId, fresh);
+      added += 1;
+    }
+    const updated = new Set();
+    for (const u of result.updates || []) {
+      const s = byThread.get(u.threadId);
+      // One part per story per run date: a story admitted by this run has its
+      // backstory already.
+      if (!s || updated.has(u.threadId) || s.parts[s.parts.length - 1].date === d) continue;
+      s.parts.push(stamp(u.part));
+      updated.add(u.threadId);
+      added += 1;
+    }
+    nextRanking = [...new Set(result.ranking || [])].filter(id => byThread.has(id));
+
+    const replacing = d === today && last === d;
+    if (replacing) outcome = OUTCOME.REPLACED;
+    else if (added) outcome = OUTCOME.APPENDED;
+    else if (!sameList(nextRanking, ranking)) outcome = OUTCOME.RANKED;
   }
 
   const $set = {
@@ -204,18 +250,11 @@ function storeUpdate({ story, date: d, today, section, consumed, model, now, lat
     late: d === today ? null : (late || story.late || null),
     updatedAt: now,
   };
-  const update = { $set, $unset: { [`attempts.${d}`]: '' } };
-
-  if (outcome === OUTCOME.APPENDED) update.$push = { sections: stored };
-  if (outcome === OUTCOME.REPLACED) {
-    filter[`sections.${sections.length - 1}.date`] = today;
-    $set[`sections.${sections.length - 1}`] = stored;
-  }
   if (outcome !== OUTCOME.NONE) {
-    $set.admitted = [...admittedThreads({ sections: next }, '9999-12-31')];
+    $set.stories = next;
+    $set.ranking = nextRanking;
   }
-
-  return { filter, update, outcome };
+  return { filter, update: { $set, $unset: { [`attempts.${d}`]: '' } }, outcome };
 }
 
 // What the period endpoint can say about the story. `due` is dueRuns,
@@ -229,7 +268,7 @@ function storyStatus({ articleCount, due, queued, enabled }) {
 
 // A period's story before any run. `periodId` comes from the upsert filter.
 function emptyStory() {
-  return { sections: [], admitted: [], throughDate: null, seenUpTo: null, attempts: {}, late: null };
+  return { stories: [], ranking: [], throughDate: null, seenUpTo: null, attempts: {}, late: null };
 }
 
 module.exports = {

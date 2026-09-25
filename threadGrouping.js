@@ -104,7 +104,7 @@ async function groupNextEdition({ db, ask }, throughDate) {
 
 // Groups every ungrouped edition on or before `throughDate`, oldest first, one
 // model call each. Returns the edition dates it grouped, in order. The catch-up
-// run calls this before it writes a section for `throughDate`.
+// run calls this before it ranks the stories for `throughDate`.
 async function groupThrough(deps, throughDate) {
   const done = [];
   for (;;) {

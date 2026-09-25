@@ -61,85 +61,83 @@ test('a missing array is an empty array, never undefined', () => {
 const { toPeriod, toStory, storyArticleIds } = require('../wire');
 const { parsePeriodId } = require('../period');
 
-const entry = (threadId, articleIds, extra = {}) => ({
-  threadId,
-  kind: 'new',
-  headline: `Headline ${threadId}`,
-  paragraphs: [`Paragraph for ${threadId}.`],
+const part = (date, kind, articleIds, extra = {}) => ({
+  date,
+  kind,
+  paragraphs: [`${kind} on ${date}.`],
   articleIds,
-  continuesFrom: null,
   verification: 'sources',
   basis: 'A quoted order.',
   why: 'Three editions, four sources.',
+  writtenAt: new Date(0),
+  model: 'some/model',
   ...extra,
 });
 
 const storedStory = {
   _id: 'mongo-oid',
   periodId: '2026-W38',
-  admitted: ['t2', 't1'],
-  throughDate: '2026-09-16',
+  throughDate: '2026-09-17',
   seenUpTo: new Date(0),
-  attempts: { '2026-09-17': 1 },
-  sections: [
+  attempts: { '2026-09-18': 1 },
+  late: null,
+  stories: [
+    { threadId: 't1', headline: 'Headline t1', parts: [part('2026-09-15', 'backstory', ['a2'])] },
     {
-      date: '2026-09-15',
-      writtenAt: new Date(0),
-      model: 'some/model',
-      entries: [entry('t2', ['a3', 'a1']), entry('t1', ['a2'])],
+      threadId: 't2',
+      headline: 'Headline t2',
+      parts: [part('2026-09-15', 'backstory', ['a3', 'a1']), part('2026-09-16', 'update', ['a4']), part('2026-09-17', 'correction', ['a4'])],
     },
-    {
-      date: '2026-09-16',
-      writtenAt: new Date(0),
-      model: 'some/model',
-      entries: [entry('t2', ['a4'], { kind: 'update', continuesFrom: '2026-09-15' })],
-    },
+    // Dropped out of the ranking: kept, never served.
+    { threadId: 't3', headline: 'Headline t3', parts: [part('2026-09-16', 'backstory', ['a5'])] },
   ],
+  ranking: ['t2', 't1'],
 };
 
-const allVisible = new Set(['a1', 'a2', 'a3', 'a4']);
+const allVisible = new Set(['a1', 'a2', 'a3', 'a4', 'a5']);
 
-test('the story keeps stored order for sections and entries', () => {
+test('the story serves the ranked stories in ranking order, parts in stored order', () => {
   const story = toStory(storedStory, allVisible);
-  assert.deepEqual(story.sections.map(s => s.date), ['2026-09-15', '2026-09-16']);
-  assert.deepEqual(story.sections[0].entries.map(e => e.threadId), ['t2', 't1']);
-  assert.deepEqual(story.sections[0].entries[0].articleIds, ['a3', 'a1']);
+  assert.deepEqual(story.stories.map(s => s.threadId), ['t2', 't1']);
+  assert.deepEqual(story.stories[0].parts.map(p => [p.date, p.kind]), [
+    ['2026-09-15', 'backstory'], ['2026-09-16', 'update'], ['2026-09-17', 'correction'],
+  ]);
+  assert.deepEqual(story.stories[0].parts[0].articleIds, ['a3', 'a1']);
+});
+
+test('a story out of the ranking, or a ranked id with no story, is not served', () => {
+  const story = toStory({ ...storedStory, ranking: ['t9', 't1', 't1'] }, allVisible);
+  assert.deepEqual(story.stories.map(s => s.threadId), ['t1']);
+  assert.equal(JSON.stringify(story).includes('t3'), false);
 });
 
 test('audit fields never reach the wire', () => {
   const story = toStory(storedStory, allVisible);
-  assert.deepEqual(Object.keys(story), ['sections']);
-  for (const section of story.sections) {
-    assert.deepEqual(Object.keys(section).sort(), ['date', 'entries']);
-    for (const e of section.entries) {
-      assert.deepEqual(Object.keys(e).sort(), [
-        'articleIds', 'continuesFrom', 'headline', 'kind', 'paragraphs', 'threadId',
-      ]);
-    }
+  assert.deepEqual(Object.keys(story), ['stories']);
+  for (const s of story.stories) {
+    assert.deepEqual(Object.keys(s), ['threadId', 'headline', 'parts']);
+    for (const p of s.parts) assert.deepEqual(Object.keys(p), ['date', 'kind', 'paragraphs', 'articleIds']);
   }
-  assert.deepEqual(story.sections[1].entries[0], {
-    threadId: 't2',
-    kind: 'update',
-    headline: 'Headline t2',
-    paragraphs: ['Paragraph for t2.'],
-    articleIds: ['a4'],
-    continuesFrom: '2026-09-15',
+  assert.deepEqual(story.stories[1], {
+    threadId: 't1',
+    headline: 'Headline t1',
+    parts: [{ date: '2026-09-15', kind: 'backstory', paragraphs: ['backstory on 2026-09-15.'], articleIds: ['a2'] }],
   });
 });
 
-test('hidden article ids are removed, and an entry left with none is still served', () => {
+test('hidden article ids are removed, and a part left with none is still served', () => {
   const story = toStory(storedStory, new Set(['a1', 'a4']));
-  assert.deepEqual(story.sections[0].entries.map(e => e.articleIds), [['a1'], []]);
-  assert.equal(story.sections[0].entries[1].headline, 'Headline t1');
-  assert.deepEqual(story.sections[1].entries[0].articleIds, ['a4']);
+  assert.deepEqual(story.stories[0].parts.map(p => p.articleIds), [['a1'], ['a4'], ['a4']]);
+  assert.deepEqual(story.stories[1].parts[0].articleIds, []);
+  assert.equal(story.stories[1].parts[0].paragraphs.length, 1);
 });
 
-test('a story with no run yet is an empty list of sections', () => {
-  assert.deepEqual(toStory(null, new Set()), { sections: [] });
-  assert.deepEqual(toStory({ sections: [] }, new Set()), { sections: [] });
+test('a story with no run yet is an empty list of stories', () => {
+  assert.deepEqual(toStory(null, new Set()), { stories: [] });
+  assert.deepEqual(toStory({ stories: [], ranking: [] }, new Set()), { stories: [] });
 });
 
-test('the ids to check for visibility are every id the story cites, once', () => {
+test('the ids to check for visibility are every id the served stories cite, once', () => {
   assert.deepEqual(storyArticleIds(storedStory).sort(), ['a1', 'a2', 'a3', 'a4']);
   assert.deepEqual(storyArticleIds(null), []);
 });
@@ -176,7 +174,7 @@ test('the period skeleton is unchanged, field for field', () => {
   assert.deepEqual(body.timeline.map(d => d.date), ['2026-09-14', '2026-09-15', '2026-09-16', '2026-09-17', '2026-09-18', '2026-09-19', '2026-09-20']);
   assert.deepEqual(body.timeline.map(d => d.count), [3, 0, 2, 0, 0, 0, 0]);
   assert.equal(body.storyStatus, 'ready');
-  assert.equal(body.story.sections.length, 2);
+  assert.deepEqual(body.story.stories.map(x => x.threadId), ['t2', 't1']);
 });
 
 test('an empty period serves the skeleton and an empty story', () => {
@@ -186,6 +184,6 @@ test('an empty period serves the skeleton and an empty story', () => {
   assert.equal(body.articleCount, 0);
   assert.deepEqual(body.categories, []);
   assert.ok(body.timeline.every(d => d.count === 0));
-  assert.deepEqual(body.story, { sections: [] });
+  assert.deepEqual(body.story, { stories: [] });
   assert.equal(body.storyStatus, 'none');
 });

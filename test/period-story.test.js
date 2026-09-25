@@ -23,11 +23,13 @@ function story(extra = {}) {
 
 const edition = (date, newest) => ({ date, newest: newest ? t(newest) : null });
 
-const section = (date, threadId = 'T1', kind = 'new') => ({
-  date,
-  entries: [{ threadId, kind, headline: `H ${date}`, paragraphs: ['P'], articleIds: ['a'], continuesFrom: null, why: 'w' }],
-  writtenAt: t('2026-09-01T00:00:00Z'),
-  model: 'm',
+const written = (threadId, dates, headline = `Story ${threadId}`) => ({
+  threadId,
+  headline,
+  parts: dates.map((date, i) => ({
+    date, kind: i ? 'update' : 'backstory', paragraphs: [`P ${threadId} ${date}`], articleIds: ['a'], why: 'w',
+    writtenAt: t('2026-09-01T00:00:00Z'), model: 'm',
+  })),
 });
 
 // ---- dates ----
@@ -85,7 +87,7 @@ test('nothing new since the last run means nothing is due', () => {
 test('a same-day re-push re-runs today', () => {
   const editions = [edition('2026-09-16', '2026-09-16T08:00:00Z')];
   const done = story({
-    throughDate: '2026-09-16', seenUpTo: t('2026-09-16T05:00:00Z'), sections: [section('2026-09-16')],
+    throughDate: '2026-09-16', seenUpTo: t('2026-09-16T05:00:00Z'), stories: [written('T1', ['2026-09-16'])],
   });
   assert.deepEqual(dueRuns(WEEK, '2026-09-16', editions, done), ['2026-09-16']);
 });
@@ -197,10 +199,10 @@ test('an unknown filing time never makes a run due on its own', () => {
 // ---- attempts ----
 
 test('a run claims an attempt, guarded on the progress it read', () => {
-  const s = story({ throughDate: '2026-09-14', sections: [section('2026-09-14')], attempts: { '2026-09-15': 1 } });
+  const s = story({ throughDate: '2026-09-14', stories: [written('T1', ['2026-09-14'])], attempts: { '2026-09-15': 1 } });
   const claim = claimUpdate(s, '2026-09-15');
   assert.equal(claim.attempt, 2);
-  assert.deepEqual(claim.filter, { periodId: WEEK.id, throughDate: '2026-09-14', sections: { $size: 1 } });
+  assert.deepEqual(claim.filter, { periodId: WEEK.id, throughDate: '2026-09-14', stories: { $size: 1 } });
   assert.deepEqual(claim.update, { $inc: { 'attempts.2026-09-15': 1 } });
 });
 
@@ -214,31 +216,83 @@ test('after three attempts a date is not claimed again', () => {
 
 const NOW = t('2026-09-25T10:00:00Z');
 
-function store(s, d, today, sectionOut, consumed = t('2026-09-16T05:00:00Z')) {
-  return storeUpdate({ story: s, date: d, today, section: sectionOut, consumed, model: 'm', now: NOW });
+const admit = threadId => ({ threadId, headline: `About ${threadId}`, part: { kind: 'backstory', paragraphs: ['New.'], articleIds: ['b'], verification: 'sources', why: 'w' } });
+const add = (threadId, kind = 'update') => ({ threadId, part: { kind, paragraphs: ['More.'], articleIds: ['c'], why: 'w' } });
+const result = (ranking, backstories = [], updates = []) => ({ ranking, backstories, updates });
+
+function store(s, d, today, out, consumed = t('2026-09-16T05:00:00Z')) {
+  return storeUpdate({ story: s, date: d, today, result: out, consumed, model: 'm', now: NOW });
 }
 
-test('an append is guarded on throughDate and the section count, and pushes one section', () => {
-  const s = story({ throughDate: '2026-09-14', seenUpTo: t('2026-09-14T05:00:00Z'), sections: [section('2026-09-14')] });
-  const out = store(s, '2026-09-15', '2026-09-25', { date: '2026-09-15', entries: section('x', 'T2').entries });
+test('a store is guarded on throughDate and the story count, and adds a backstory as a new story', () => {
+  const s = story({ throughDate: '2026-09-14', seenUpTo: t('2026-09-14T05:00:00Z'), stories: [written('T1', ['2026-09-14'])], ranking: ['T1'] });
+  const out = store(s, '2026-09-15', '2026-09-25', result(['T2', 'T1'], [admit('T2')]));
   assert.equal(out.outcome, 'appended');
-  assert.deepEqual(out.filter, { periodId: WEEK.id, throughDate: '2026-09-14', sections: { $size: 1 } });
-  assert.deepEqual(out.update.$push, {
-    sections: { date: '2026-09-15', entries: section('x', 'T2').entries, writtenAt: NOW, model: 'm' },
-  });
+  assert.deepEqual(out.filter, { periodId: WEEK.id, throughDate: '2026-09-14', stories: { $size: 1 } });
+  assert.deepEqual(out.update.$set.stories, [
+    written('T1', ['2026-09-14']),
+    {
+      threadId: 'T2',
+      headline: 'About T2',
+      parts: [{ date: '2026-09-15', kind: 'backstory', paragraphs: ['New.'], articleIds: ['b'], verification: 'sources', why: 'w', writtenAt: NOW, model: 'm' }],
+    },
+  ]);
+  assert.deepEqual(out.update.$set.ranking, ['T2', 'T1']);
   assert.equal(out.update.$set.throughDate, '2026-09-15');
   assert.deepEqual(out.update.$set.seenUpTo, t('2026-09-16T05:00:00Z'));
-  assert.deepEqual(out.update.$set.admitted, ['T1', 'T2']);
   assert.deepEqual(out.update.$unset, { 'attempts.2026-09-15': '' });
-  // Nothing addresses an earlier section.
-  assert.equal(Object.keys(out.update.$set).some(k => k.startsWith('sections')), false);
 });
 
-test('a run with no section still advances throughDate and seenUpTo', () => {
-  const s = story({ throughDate: '2026-09-14', seenUpTo: t('2026-09-14T05:00:00Z'), sections: [section('2026-09-14')] });
+test('an update is one part at the end of its story, and earlier parts are left as they were', () => {
+  const frozen = [written('T1', ['2026-09-14', '2026-09-15']), written('T2', ['2026-09-15'])];
+  const before = structuredClone(frozen);
+  const s = story({ throughDate: '2026-09-15', stories: frozen, ranking: ['T1', 'T2'] });
+  const out = store(s, '2026-09-16', '2026-09-25', result(['T1', 'T2'], [], [add('T1', 'correction')]));
+  assert.equal(out.outcome, 'appended');
+  assert.deepEqual(frozen, before);
+  const [t1, t2] = out.update.$set.stories;
+  assert.deepEqual(t1.parts.slice(0, 2), before[0].parts);
+  assert.deepEqual(t1.parts[2], { date: '2026-09-16', kind: 'correction', paragraphs: ['More.'], articleIds: ['c'], why: 'w', writtenAt: NOW, model: 'm' });
+  assert.deepEqual(t2, before[1]);
+});
+
+test('at most one part per story per run date', () => {
+  const s = story({ throughDate: '2026-09-15', stories: [written('T1', ['2026-09-15'])], ranking: ['T1'] });
+  const out = store(s, '2026-09-16', '2026-09-25', result(['T1', 'T2'], [admit('T2'), admit('T1')], [add('T1'), add('T1', 'correction'), add('T2')]));
+  const [t1, t2] = out.update.$set.stories;
+  assert.deepEqual(t1.parts.map(p => [p.date, p.kind]), [['2026-09-15', 'backstory'], ['2026-09-16', 'update']]);
+  assert.deepEqual(t2.parts.map(p => [p.date, p.kind]), [['2026-09-16', 'backstory']]);
+});
+
+test('a story that drops out of the ranking keeps its text, and continues from it when it comes back', () => {
+  const s = story({ throughDate: '2026-09-15', stories: [written('T1', ['2026-09-14']), written('T2', ['2026-09-15'])], ranking: ['T1', 'T2'] });
+  const dropped = store(s, '2026-09-16', '2026-09-25', result(['T2']));
+  assert.equal(dropped.outcome, 'ranked');
+  assert.deepEqual(dropped.update.$set.ranking, ['T2']);
+  assert.deepEqual(dropped.update.$set.stories.map(x => x.threadId), ['T1', 'T2']);
+  assert.deepEqual(dropped.update.$set.stories[0], s.stories[0]);
+
+  const later = story({ throughDate: '2026-09-16', stories: dropped.update.$set.stories, ranking: ['T2'] });
+  const back = store(later, '2026-09-17', '2026-09-25', result(['T1', 'T2'], [admit('T1')], [add('T1')]));
+  // No new backstory: T1 continues from the text it had.
+  assert.deepEqual(back.update.$set.stories[0].parts.map(p => [p.date, p.kind]), [['2026-09-14', 'backstory'], ['2026-09-17', 'update']]);
+  assert.equal(back.update.$set.stories[0].headline, 'Story T1');
+  assert.deepEqual(back.update.$set.ranking, ['T1', 'T2']);
+});
+
+test('the ranking holds only stories that exist, each once', () => {
+  const s = story({ throughDate: '2026-09-15', stories: [written('T1', ['2026-09-15'])], ranking: ['T1'] });
+  const out = store(s, '2026-09-16', '2026-09-25', result(['T9', 'T1', 'T1']));
+  assert.equal(out.outcome, 'none');
+  assert.equal(out.update.$set.ranking, undefined);
+});
+
+test('a run with no result still advances throughDate and seenUpTo, and changes no text', () => {
+  const s = story({ throughDate: '2026-09-14', seenUpTo: t('2026-09-14T05:00:00Z'), stories: [written('T1', ['2026-09-14'])], ranking: ['T1'] });
   const out = store(s, '2026-09-15', '2026-09-25', null);
   assert.equal(out.outcome, 'none');
-  assert.equal(out.update.$push, undefined);
+  assert.equal(out.update.$set.stories, undefined);
+  assert.equal(out.update.$set.ranking, undefined);
   assert.equal(out.update.$set.throughDate, '2026-09-15');
   assert.deepEqual(out.update.$set.seenUpTo, t('2026-09-16T05:00:00Z'));
 });
@@ -250,62 +304,57 @@ test('seenUpTo and throughDate never move backwards', () => {
   assert.deepEqual(out.update.$set.seenUpTo, t('2026-09-20T05:00:00Z'));
 });
 
-test('a run dated today replaces the section dated today, and only that one', () => {
-  const s = story({ throughDate: '2026-09-16', sections: [section('2026-09-15'), section('2026-09-16', 'T2')] });
-  const fresh = { date: '2026-09-16', entries: section('x', 'T3').entries };
-  const out = store(s, '2026-09-16', '2026-09-16', fresh);
-  assert.equal(out.outcome, 'replaced');
-  assert.deepEqual(out.filter, {
-    periodId: WEEK.id, throughDate: '2026-09-16', sections: { $size: 2 }, 'sections.1.date': '2026-09-16',
+test("a run dated today replaces today's parts and today's ranking, and only those", () => {
+  // Today's run admitted T3 and updated T1, and ranked T3 first.
+  const s = story({
+    throughDate: '2026-09-16',
+    stories: [written('T1', ['2026-09-15', '2026-09-16']), written('T2', ['2026-09-15']), written('T3', ['2026-09-16'])],
+    ranking: ['T3', 'T1', 'T2'],
   });
-  assert.deepEqual(out.update.$set['sections.1'].entries, fresh.entries);
-  assert.equal(out.update.$set['sections.0'], undefined);
-  assert.equal(out.update.$push, undefined);
-  // T2 was admitted only by the section being replaced.
-  assert.deepEqual(out.update.$set.admitted, ['T1', 'T3']);
+  const before = structuredClone(s.stories);
+  const out = store(s, '2026-09-16', '2026-09-16', result(['T2', 'T4', 'T1'], [admit('T4')], [add('T2')]));
+  assert.equal(out.outcome, 'replaced');
+  assert.deepEqual(out.filter, { periodId: WEEK.id, throughDate: '2026-09-16', stories: { $size: 3 } });
+  const next = out.update.$set.stories;
+  // T1 loses today's update and keeps yesterday's backstory. T3, admitted
+  // today and not ranked again, goes with its backstory. T2 gets today's part.
+  assert.deepEqual(next.map(x => [x.threadId, x.parts.map(p => p.date)]), [
+    ['T1', ['2026-09-15']], ['T2', ['2026-09-15', '2026-09-16']], ['T4', ['2026-09-16']],
+  ]);
+  assert.deepEqual(next[0].parts[0], before[0].parts[0]);
+  assert.deepEqual(next[1].parts[0], before[1].parts[0]);
+  assert.deepEqual(out.update.$set.ranking, ['T2', 'T4', 'T1']);
 });
 
-test('a same-day re-run that finds nothing keeps the section already written', () => {
-  const s = story({ throughDate: '2026-09-16', sections: [section('2026-09-16')] });
+test('a same-day re-run with no result keeps what today already wrote', () => {
+  const s = story({ throughDate: '2026-09-16', stories: [written('T1', ['2026-09-16'])], ranking: ['T1'] });
   const out = store(s, '2026-09-16', '2026-09-16', null);
   assert.equal(out.outcome, 'none');
-  assert.equal(out.update.$set['sections.0'], undefined);
+  assert.equal(out.update.$set.stories, undefined);
 });
 
-test('a section dated before today is never rewritten, by any path', () => {
-  const s = story({ throughDate: '2026-09-16', sections: [section('2026-09-16')] });
-  const again = { date: '2026-09-16', entries: section('x', 'T9').entries };
+test('a part dated before today is never rewritten, by any path', () => {
+  const s = story({ throughDate: '2026-09-16', stories: [written('T1', ['2026-09-16'])], ranking: ['T1'] });
   // The same date, but today has moved on.
-  const late = store(s, '2026-09-16', '2026-09-17', again);
+  const late = store(s, '2026-09-16', '2026-09-17', result(['T9'], [admit('T9')]));
   assert.equal(late.outcome, 'none');
-  assert.equal(late.update.$push, undefined);
-  assert.equal(Object.keys(late.update.$set).some(k => k.startsWith('sections')), false);
-  // An earlier date than the last section.
-  const earlier = store(s, '2026-09-15', '2026-09-25', { date: '2026-09-15', entries: again.entries });
+  assert.equal(late.update.$set.stories, undefined);
+  assert.equal(late.update.$set.ranking, undefined);
+  // An earlier date than the last part.
+  const earlier = store(s, '2026-09-15', '2026-09-25', result([], [], [add('T1')]));
   assert.equal(earlier.outcome, 'none');
-  assert.equal(earlier.update.$push, undefined);
-});
-
-test('a later run appends after the frozen sections and leaves them as they were', () => {
-  const frozen = [section('2026-09-14'), section('2026-09-15', 'T2')];
-  const before = structuredClone(frozen);
-  const s = story({ throughDate: '2026-09-15', sections: frozen });
-  const out = store(s, '2026-09-16', '2026-09-16', { date: '2026-09-16', entries: section('x', 'T1', 'update').entries });
-  assert.equal(out.outcome, 'appended');
-  assert.deepEqual(frozen, before);
-  assert.deepEqual(out.update.$set.admitted, ['T1', 'T2']);
+  assert.equal(earlier.update.$set.stories, undefined);
 });
 
 test('an edition run stores the late mark, and the run dated today clears it', () => {
   const mark = [{ through: '2026-09-15', after: t('2026-09-15T05:00:00Z') }];
-  const s = story({ throughDate: '2026-09-15', seenUpTo: t('2026-09-15T05:00:00Z'), sections: [section('2026-09-15')] });
-  const edition17 = storeUpdate({ story: s, date: '2026-09-17', today: '2026-09-18', section: null, consumed: t('2026-09-18T08:00:00Z'), model: 'm', now: NOW, late: mark });
+  const s = story({ throughDate: '2026-09-15', seenUpTo: t('2026-09-15T05:00:00Z'), stories: [written('T1', ['2026-09-15'])] });
+  const edition17 = storeUpdate({ story: s, date: '2026-09-17', today: '2026-09-18', result: null, consumed: t('2026-09-18T08:00:00Z'), model: 'm', now: NOW, late: mark });
   assert.deepEqual(edition17.update.$set.late, mark);
-  // The guard is the same as for any store.
-  assert.deepEqual(edition17.filter, { periodId: WEEK.id, throughDate: '2026-09-15', sections: { $size: 1 } });
+  assert.deepEqual(edition17.filter, { periodId: WEEK.id, throughDate: '2026-09-15', stories: { $size: 1 } });
 
-  const marked = story({ throughDate: '2026-09-17', seenUpTo: t('2026-09-18T08:00:00Z'), sections: [section('2026-09-15')], late: mark });
-  const todayRun = storeUpdate({ story: marked, date: '2026-09-18', today: '2026-09-18', section: { date: '2026-09-18', entries: section('x', 'T4').entries }, consumed: t('2026-09-18T08:00:00Z'), model: 'm', now: NOW, late: mark });
+  const marked = story({ throughDate: '2026-09-17', seenUpTo: t('2026-09-18T08:00:00Z'), stories: [written('T1', ['2026-09-15'])], late: mark });
+  const todayRun = storeUpdate({ story: marked, date: '2026-09-18', today: '2026-09-18', result: result(['T4'], [admit('T4')]), consumed: t('2026-09-18T08:00:00Z'), model: 'm', now: NOW, late: mark });
   assert.equal(todayRun.outcome, 'appended');
   assert.equal(todayRun.update.$set.late, null);
   assert.equal(todayRun.update.$set.throughDate, '2026-09-18');
@@ -313,7 +362,8 @@ test('an edition run stores the late mark, and the run dated today clears it', (
 
 test('the first store is guarded on an empty story', () => {
   const out = store(story(), '2026-09-14', '2026-09-25', null);
-  assert.deepEqual(out.filter, { periodId: WEEK.id, throughDate: null, sections: { $size: 0 } });
+  assert.deepEqual(out.filter, { periodId: WEEK.id, throughDate: null, stories: { $size: 0 } });
+  assert.deepEqual(emptyStory(), { stories: [], ranking: [], throughDate: null, seenUpTo: null, attempts: {}, late: null });
 });
 
 // ---- status ----

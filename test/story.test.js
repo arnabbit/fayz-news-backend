@@ -3,16 +3,19 @@ const assert = require('node:assert/strict');
 const {
   STORY_DEFINITION,
   BARS,
-  MIN_SOURCES,
+  BUDGETS,
   MIN_EDITIONS,
+  MIN_SOURCES,
   MAX_PARAGRAPHS,
-  admittedThreads,
+  TRAIL_ARTICLES,
+  storySoFar,
   buildEvidence,
   buildStoryPrompt,
-  validateSection,
+  validateRanking,
 } = require('../story');
 
 const WEEK = { id: '2026-W38', kind: 'week', range: { from: '2026-09-14', to: '2026-09-20' } };
+const MONTH = { id: '2026-09', kind: 'month', range: { from: '2026-09-01', to: '2026-09-30' } };
 
 const sources = n => Array.from({ length: n }, (_, i) => ({ postUrl: `https://x/${i}` }));
 
@@ -37,9 +40,9 @@ const THREADS = [
   { threadId: 'T-court', title: 'Court ruling on data law', category: 'law' },
 ];
 
-// T-cease: two editions, two sources in total. Passes both code checks.
-// T-rupee: one edition, many sources. Fails "lasting".
-// T-flood: two editions, one source in total. Fails "verified" without a basis.
+// T-cease: two editions, two sources in total. A candidate, verified by sources.
+// T-rupee: one edition, many sources. Not lasting, so not a candidate.
+// T-flood: two editions, one source in total. Not verified without a basis.
 // T-court: two editions, one source, with an official text to quote.
 const ARTICLES = [
   article('c1', 'T-cease', '2026-09-15'),
@@ -54,15 +57,20 @@ const ARTICLES = [
   article('k2', 'T-court', '2026-09-17'),
 ];
 
-const EMPTY_STORY = { sections: [] };
+const EMPTY_STORY = { stories: [], ranking: [] };
 
 function evidenceFor(d, story = EMPTY_STORY, articles = ARTICLES, period = WEEK) {
   return buildEvidence(period, d, THREADS, articles, story);
 }
 
-const entry = (threadId, kind, extra = {}) => ({
+const part = (date, kind = 'backstory', extra = {}) => ({
+  date, kind, paragraphs: [`Written ${kind} on ${date}.`], articleIds: ['c1'], why: 'w', writtenAt: new Date(0), model: 'm', ...extra,
+});
+
+const written = (threadId, parts, headline = `Story of ${threadId}`) => ({ threadId, headline, parts });
+
+const backstory = (threadId, extra = {}) => ({
   threadId,
-  kind,
   headline: `About ${threadId}`,
   paragraphs: ['It happened.'],
   articleIds: [],
@@ -70,72 +78,116 @@ const entry = (threadId, kind, extra = {}) => ({
   ...extra,
 });
 
-const reply = entries => JSON.stringify({ entries });
-
-// ---- evidence ----
-
-test('evidence counts sources and distinct editions per thread, up to d', () => {
-  const ev = evidenceFor('2026-09-17');
-  const byId = new Map(ev.map(t => [t.threadId, t]));
-  assert.equal(byId.get('T-cease').totalSources, 2);
-  assert.equal(byId.get('T-cease').editionCount, 2);
-  assert.equal(byId.get('T-rupee').totalSources, 5);
-  assert.equal(byId.get('T-rupee').editionCount, 1);
-  assert.equal(byId.get('T-flood').totalSources, 1);
-
-  const early = new Map(evidenceFor('2026-09-15').map(t => [t.threadId, t]));
-  assert.deepEqual([...early.keys()], ['T-cease']);
-  assert.equal(early.get('T-cease').editionCount, 1);
+const update = (threadId, extra = {}) => ({
+  threadId, kind: 'update', paragraphs: ['Then more happened.'], articleIds: [], why: 'new facts', ...extra,
 });
 
-test('evidence leaves out threads with nothing in the period, hidden articles and articles after d', () => {
+const reply = (ranking, backstories = [], updates = []) => JSON.stringify({ ranking, backstories, updates });
+
+// ---- the budget and the lasting test ----
+
+test('the budgets and the minimum editions are the ones the design names', () => {
+  assert.deepEqual(BUDGETS, { week: 5, month: 20, quarter: 60, year: 240 });
+  assert.deepEqual(MIN_EDITIONS, { week: 2, month: 3, quarter: 5, year: 10 });
+  assert.equal(MIN_SOURCES, 2);
+  assert.equal(TRAIL_ARTICLES, 8);
+});
+
+test('a thread on fewer than the minimum editions of the period is not a candidate', () => {
+  const ev = evidenceFor('2026-09-17');
+  assert.deepEqual(ev.map(t => t.threadId).sort(), ['T-cease', 'T-court', 'T-flood']);
+  // A month needs three editions: none of these threads has them.
+  assert.deepEqual(evidenceFor('2026-09-17', EMPTY_STORY, ARTICLES, MONTH), []);
+  const three = [...ARTICLES, article('c3', 'T-cease', '2026-09-18')];
+  assert.deepEqual(evidenceFor('2026-09-18', EMPTY_STORY, three, MONTH).map(t => t.threadId), ['T-cease']);
+});
+
+test('the editions counted are distinct, up to d and inside the period', () => {
+  const articles = [
+    article('c1', 'T-cease', '2026-09-15'),
+    article('c1b', 'T-cease', '2026-09-15'),
+    article('c2', 'T-cease', '2026-09-19'),
+  ];
+  // Two articles on one edition are one edition.
+  assert.deepEqual(evidenceFor('2026-09-18', EMPTY_STORY, articles), []);
+  assert.equal(evidenceFor('2026-09-19', EMPTY_STORY, articles)[0].editionCount, 2);
+
+  // A grace-window edition is evidence, but not an edition of the period.
+  const grace = [article('c1', 'T-cease', '2026-09-19'), article('c2', 'T-cease', '2026-09-21')];
+  assert.deepEqual(evidenceFor('2026-09-22', EMPTY_STORY, grace), []);
+  const lasting = [...grace, article('c0', 'T-cease', '2026-09-18')];
+  const ev = evidenceFor('2026-09-22', EMPTY_STORY, lasting);
+  assert.equal(ev[0].editionCount, 2);
+  assert.equal(ev[0].articles.find(a => a.id === 'c2').inPeriod, false);
+});
+
+test('evidence counts sources over the whole trail and leaves out hidden articles and articles after d', () => {
   const articles = [
     article('old', 'T-rupee', '2026-09-10'),
     article('h1', 'T-flood', '2026-09-15', { hidden: true }),
+    article('f2', 'T-flood', '2026-09-16'),
     article('late', 'T-court', '2026-09-19'),
+    article('k1', 'T-court', '2026-09-16'),
     article('c1', 'T-cease', '2026-09-15'),
+    article('c2', 'T-cease', '2026-09-16', { sourcePosts: sources(3) }),
   ];
   const ev = evidenceFor('2026-09-17', EMPTY_STORY, articles);
   assert.deepEqual(ev.map(t => t.threadId), ['T-cease']);
+  assert.equal(ev[0].totalSources, 4);
 });
 
-test('a thread seen only in the grace window is not evidence; grace articles of a period thread are', () => {
-  const articles = [
-    article('c1', 'T-cease', '2026-09-19'),
-    article('c2', 'T-cease', '2026-09-21'),
-    article('g1', 'T-rupee', '2026-09-21'),
-  ];
-  const ev = evidenceFor('2026-09-22', EMPTY_STORY, articles);
-  assert.deepEqual(ev.map(t => t.threadId), ['T-cease']);
-  assert.equal(ev[0].editionCount, 2);
-  const grace = ev[0].articles.find(a => a.id === 'c2');
-  assert.equal(grace.inPeriod, false);
+test('the trail is cut to its most recent articles; every in-period id stays citable', () => {
+  const days = Array.from({ length: 12 }, (_, i) => `2026-09-${String(i + 1).padStart(2, '0')}`);
+  const articles = days.map((date, i) => article(`c${i + 1}`, 'T-cease', date));
+  const [thread] = evidenceFor('2026-09-12', EMPTY_STORY, articles, MONTH);
+  assert.deepEqual(thread.articles.map(a => a.id), ['c5', 'c6', 'c7', 'c8', 'c9', 'c10', 'c11', 'c12']);
+  assert.equal(thread.omitted, 4);
+  assert.equal(thread.editionCount, 12);
+  assert.equal(thread.citable.length, 12);
+  const prompt = buildStoryPrompt(MONTH, '2026-09-12', [thread], EMPTY_STORY);
+  assert.ok(!prompt.includes('Headline c4\n'));
+  assert.ok(prompt.includes('4 earlier ones left out'));
 });
 
 test('evidence keeps full bodies only for articles dated d', () => {
-  const ev = evidenceFor('2026-09-17');
-  const cease = ev.find(t => t.threadId === 'T-cease');
+  const cease = evidenceFor('2026-09-17').find(t => t.threadId === 'T-cease');
   assert.equal(cease.articles.find(a => a.id === 'c1').body, null);
   assert.deepEqual(cease.articles.find(a => a.id === 'c2').body, [
     'Body of c2, first paragraph.', 'Body of c2, second paragraph.',
   ]);
 });
 
-test('admitted threads come from the new entries of sections before d', () => {
+test('ranked threads come first, in ranking order, then by first appearance', () => {
   const story = {
-    sections: [
-      { date: '2026-09-16', entries: [entry('T-cease', 'new'), entry('T-flood', 'update')] },
-      { date: '2026-09-17', entries: [entry('T-rupee', 'new')] },
-    ],
+    stories: [written('T-court', [part('2026-09-16')]), written('T-flood', [part('2026-09-16')])],
+    ranking: ['T-flood', 'T-court'],
   };
-  assert.deepEqual([...admittedThreads(story, '2026-09-17')], ['T-cease']);
-  assert.deepEqual([...admittedThreads(story, '2026-09-18')].sort(), ['T-cease', 'T-rupee']);
-  assert.deepEqual([...admittedThreads(null, '2026-09-18')], []);
+  const ev = evidenceFor('2026-09-17', story);
+  assert.deepEqual(ev.map(t => [t.threadId, t.written]), [['T-flood', true], ['T-court', true], ['T-cease', false]]);
+});
+
+// ---- the story so far ----
+
+test('the story so far has only parts dated before d, and only stories left with one', () => {
+  const story = {
+    stories: [
+      written('T-cease', [part('2026-09-15'), part('2026-09-17', 'update')]),
+      written('T-court', [part('2026-09-17')]),
+    ],
+    ranking: ['T-court', 'T-cease'],
+  };
+  const sofar = storySoFar(story, '2026-09-17');
+  assert.deepEqual(sofar.stories.map(s => [s.threadId, s.parts.map(p => p.date)]), [['T-cease', ['2026-09-15']]]);
+  assert.deepEqual(sofar.ranking, ['T-cease']);
+  assert.equal(storySoFar(story, '2026-09-18').stories.length, 2);
+  assert.deepEqual(storySoFar(null, '2026-09-18'), { stories: [], ranking: [] });
+  // The input is not touched.
+  assert.equal(story.stories[0].parts.length, 2);
 });
 
 // ---- the prompt ----
 
-test('the prompt carries the definition verbatim and the four checks', () => {
+test('the prompt carries the definition verbatim, the four checks, the budget and the minimum', () => {
   const prompt = buildStoryPrompt(WEEK, '2026-09-17', evidenceFor('2026-09-17'), EMPTY_STORY);
   assert.ok(prompt.includes(STORY_DEFINITION));
   for (const check of ['verified', 'material change', 'consequences', 'lasting']) {
@@ -143,50 +195,59 @@ test('the prompt carries the definition verbatim and the four checks', () => {
   }
   assert.ok(prompt.includes('2026-W38'));
   assert.ok(prompt.includes('2026-09-14') && prompt.includes('2026-09-20'));
+  assert.ok(prompt.includes('at most 5'));
+  assert.ok(prompt.includes('The budget is a ceiling, not a target: rank fewer when fewer qualify'));
+  const month = buildStoryPrompt(MONTH, '2026-09-17', [], EMPTY_STORY);
+  assert.ok(month.includes('at most 20'));
+  assert.ok(month.includes('3 or more editions'));
 });
 
-test('the prompt carries full bodies only for articles dated d', () => {
+test('the prompt carries the writing rules', () => {
+  const prompt = buildStoryPrompt(WEEK, '2026-09-17', evidenceFor('2026-09-17'), EMPTY_STORY);
+  assert.ok(prompt.includes('Plain past-tense newspaper English. No markdown'));
+  assert.ok(prompt.includes('Only facts present in the evidence'));
+  assert.match(prompt, /backstory: .*told from its start in the period up to this edition/);
+  assert.match(prompt, /update: .*Tell only what is new, and open by joining to the story so far/);
+});
+
+test('the prompt carries full bodies only for articles dated d, and never source posts', () => {
   const prompt = buildStoryPrompt(WEEK, '2026-09-17', evidenceFor('2026-09-17'), EMPTY_STORY);
   assert.ok(prompt.includes('Body of c2, first paragraph.'));
-  assert.ok(prompt.includes('Body of c2, second paragraph.'));
   assert.ok(!prompt.includes('Body of c1'));
-  assert.ok(!prompt.includes('Body of f1'));
-  // The rest of an earlier article's trail is still there.
   assert.ok(prompt.includes('Headline c1'));
   assert.ok(prompt.includes('Dek c1'));
   assert.ok(prompt.includes('Development of c1'));
-});
-
-test('the prompt never carries source posts', () => {
-  const articles = [article('c1', 'T-cease', '2026-09-17', { sourcePosts: [{ postUrl: 'https://secret/1' }] })];
-  const prompt = buildStoryPrompt(WEEK, '2026-09-17', evidenceFor('2026-09-17', EMPTY_STORY, articles), EMPTY_STORY);
-  assert.ok(!prompt.includes('https://secret/1'));
+  assert.ok(!prompt.includes('https://x/0'));
 });
 
 test("the prompt's bar changes with the period kind", () => {
   const prompts = {};
   for (const kind of ['week', 'month', 'quarter', 'year']) {
-    const period = { ...WEEK, kind };
-    prompts[kind] = buildStoryPrompt(period, '2026-09-17', evidenceFor('2026-09-17', EMPTY_STORY, ARTICLES, period), EMPTY_STORY);
+    prompts[kind] = buildStoryPrompt({ ...WEEK, kind }, '2026-09-17', [], EMPTY_STORY);
     assert.ok(prompts[kind].includes(BARS[kind]), kind);
+    assert.ok(prompts[kind].includes(`at most ${BUDGETS[kind]}`), kind);
   }
   assert.ok(!prompts.week.includes(BARS.year));
-  assert.ok(!prompts.year.includes(BARS.week));
   assert.match(BARS.month, /most week-level stories do not qualify/);
   assert.match(BARS.year, /expect very few/);
 });
 
-test('the prompt shows what is already written for an admitted thread', () => {
+test('the prompt shows the current ranking and the text already written for each story', () => {
   const story = {
-    sections: [{
-      date: '2026-09-15',
-      entries: [entry('T-cease', 'new', { headline: 'Talks open in Doha', paragraphs: ['Envoys met on Monday.'] })],
-    }],
+    stories: [written('T-cease', [
+      part('2026-09-15', 'backstory', { paragraphs: ['Envoys met on Monday.'] }),
+      part('2026-09-16', 'update', { paragraphs: ['Talks resumed on Tuesday.'] }),
+    ], 'Talks open in Doha')],
+    ranking: ['T-cease'],
   };
   const prompt = buildStoryPrompt(WEEK, '2026-09-17', evidenceFor('2026-09-17', story), story);
-  assert.ok(prompt.includes('Talks open in Doha'));
+  assert.ok(prompt.includes('1. T-cease: Talks open in Doha'));
   assert.ok(prompt.includes('Envoys met on Monday.'));
-  assert.match(prompt, /admitted: yes/);
+  assert.ok(prompt.includes('[2026-09-16] update:'));
+  assert.ok(prompt.includes('Talks resumed on Tuesday.'));
+  assert.match(prompt, /ranked now: #1\nwritten: yes/);
+  assert.match(prompt, /threadId: T-court\n[\s\S]*?ranked now: no\nwritten: no/);
+  assert.ok(buildStoryPrompt(WEEK, '2026-09-17', [], EMPTY_STORY).includes('No story is ranked yet.'));
 });
 
 test('the prompt names the grace window only when d is after the period', () => {
@@ -194,170 +255,170 @@ test('the prompt names the grace window only when d is after the period', () => 
   assert.ok(!inside.includes('the period is over'));
   const grace = buildStoryPrompt(WEEK, '2026-09-22', evidenceFor('2026-09-22'), EMPTY_STORY);
   assert.ok(grace.includes('the period is over; you may only admit stories whose events happened on or before 2026-09-20'));
-  assert.ok(grace.includes('Later editions are evidence only'));
+  assert.ok(grace.includes('Do not write any "update" or "correction"'));
 });
 
-test('the prompt says so when there is no evidence', () => {
-  const prompt = buildStoryPrompt(WEEK, '2026-09-14', [], EMPTY_STORY);
-  assert.match(prompt, /no threads/i);
+test('the prompt says so when there is no candidate', () => {
+  assert.match(buildStoryPrompt(WEEK, '2026-09-14', [], EMPTY_STORY), /no candidate threads/i);
 });
 
-// ---- the validator: the code-enforced checks ----
+// ---- the validator: the ranking ----
 
-test('a thread on one edition only is never admitted, whatever the model says', () => {
+test('ranking ids must be candidates, each once, cut to the budget', () => {
+  const days = ['2026-09-14', '2026-09-15'];
+  const threads = Array.from({ length: 7 }, (_, i) => ({ threadId: `T${i}`, title: `T${i}`, category: 'world' }));
+  const articles = threads.flatMap(t => days.map(date => article(`${t.threadId}-${date}`, t.threadId, date, { sourcePosts: sources(2) })));
+  const ev = buildEvidence(WEEK, '2026-09-15', threads, articles, EMPTY_STORY);
+  const ids = ['T6', 'T6', 'nope', 'T0', 'T1', 'T2', 'T3', 'T4', 'T5'];
+  const out = validateRanking(
+    reply(ids, ids.map(id => backstory(id, { articleIds: [`${id}-2026-09-15`] }))),
+    WEEK, '2026-09-15', ev, EMPTY_STORY
+  );
+  assert.deepEqual(out.ranking, ['T6', 'T0', 'T1', 'T2', 'T3']);
+  assert.deepEqual(out.backstories.map(b => b.threadId), out.ranking);
+});
+
+test('a thread on too few editions is never ranked, whatever the model says', () => {
+  const out = validateRanking(
+    reply(['T-rupee'], [backstory('T-rupee', { articleIds: ['r1'] })]),
+    WEEK, '2026-09-17', evidenceFor('2026-09-17'), EMPTY_STORY
+  );
+  assert.deepEqual(out, { ranking: [], backstories: [], updates: [] });
+});
+
+test('a ranked thread with no written story and no valid backstory leaves the ranking', () => {
   const d = '2026-09-17';
-  const section = validateSection(
-    reply([entry('T-rupee', 'new', { articleIds: ['r1'], verification: 'official', basis: 'Headline r1' })]),
+  const out = validateRanking(
+    reply(['T-cease', 'T-court'], [backstory('T-court', { articleIds: ['k1'], verification: 'official', basis: 'the Supreme Court ordered the ministry' })]),
     WEEK, d, evidenceFor(d), EMPTY_STORY
   );
-  assert.equal(section, null);
+  assert.deepEqual(out.ranking, ['T-court']);
 });
 
-test('a thread with one source and no official basis is never admitted', () => {
+test('a written story stays ranked with no backstory, and a backstory offered for it is ignored', () => {
+  const d = '2026-09-17';
+  const story = { stories: [written('T-cease', [part('2026-09-15')])], ranking: [] };
+  const out = validateRanking(
+    reply(['T-cease'], [backstory('T-cease', { articleIds: ['c2'] })]),
+    WEEK, d, evidenceFor(d, story), story
+  );
+  // A story that dropped out comes back with its own text; no new backstory.
+  assert.deepEqual(out, { ranking: ['T-cease'], backstories: [], updates: [] });
+});
+
+test('a backstory for a thread that is not ranked is dropped', () => {
+  const d = '2026-09-17';
+  const out = validateRanking(reply([], [backstory('T-cease', { articleIds: ['c2'] })]), WEEK, d, evidenceFor(d), EMPTY_STORY);
+  assert.deepEqual(out, { ranking: [], backstories: [], updates: [] });
+});
+
+// ---- the validator: verified ----
+
+test('one source and no official basis is never admitted', () => {
   const d = '2026-09-17';
   const ev = evidenceFor(d);
-  assert.equal(validateSection(reply([entry('T-flood', 'new', { articleIds: ['f2'] })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(
-    validateSection(reply([entry('T-flood', 'new', { articleIds: ['f2'], verification: 'official' })]), WEEK, d, ev, EMPTY_STORY),
-    null
-  );
-  // A basis that quotes nothing in the thread's evidence is not a basis.
-  assert.equal(
-    validateSection(reply([entry('T-flood', 'new', {
-      articleIds: ['f2'], verification: 'official', basis: 'The government confirmed the figures.',
-    })]), WEEK, d, ev, EMPTY_STORY),
-    null
-  );
+  for (const extra of [{}, { verification: 'official' }, { verification: 'official', basis: 'The government confirmed the figures.' }, { verification: 'official', basis: 'Supreme Court' }]) {
+    const out = validateRanking(reply(['T-flood'], [backstory('T-flood', { articleIds: ['f2'], ...extra })]), WEEK, d, ev, EMPTY_STORY);
+    assert.deepEqual(out.ranking, [], JSON.stringify(extra));
+  }
 });
 
 test('one source with an official basis quoted from the evidence is admitted', () => {
   const d = '2026-09-17';
-  const section = validateSection(
-    reply([entry('T-court', 'new', {
+  const out = validateRanking(
+    reply(['T-court'], [backstory('T-court', {
       articleIds: ['k1', 'k2'], verification: 'official',
       basis: '"the Supreme Court ordered the ministry to suspend the data rule"',
     })]),
     WEEK, d, evidenceFor(d), EMPTY_STORY
   );
-  assert.equal(section.entries.length, 1);
-  assert.equal(section.entries[0].verification, 'official');
-  assert.match(section.entries[0].basis, /Supreme Court/);
+  assert.equal(out.backstories[0].part.verification, 'official');
+  assert.match(out.backstories[0].part.basis, /Supreme Court/);
 });
 
-test('two sources and two editions admit a thread', () => {
+test('two sources verify a backstory, and what is stored is exactly this', () => {
   const d = '2026-09-17';
-  const section = validateSection(
-    reply([entry('T-cease', 'new', { articleIds: ['c1', 'c2'] })]),
-    WEEK, d, evidenceFor(d), EMPTY_STORY
-  );
-  assert.deepEqual(section, {
-    date: d,
-    entries: [{
+  const out = validateRanking(reply(['T-cease'], [backstory('T-cease', { articleIds: ['c1', 'c2'] })]), WEEK, d, evidenceFor(d), EMPTY_STORY);
+  assert.deepEqual(out, {
+    ranking: ['T-cease'],
+    backstories: [{
       threadId: 'T-cease',
-      kind: 'new',
       headline: 'About T-cease',
-      paragraphs: ['It happened.'],
-      articleIds: ['c1', 'c2'],
-      continuesFrom: null,
-      verification: 'sources',
-      why: 'verified, material, consequential, lasting',
+      part: {
+        kind: 'backstory',
+        paragraphs: ['It happened.'],
+        articleIds: ['c1', 'c2'],
+        verification: 'sources',
+        why: 'verified, material, consequential, lasting',
+      },
     }],
+    updates: [],
   });
 });
 
-// ---- the validator: admitted or not ----
+// ---- the validator: updates ----
 
-const ADMITTED_STORY = {
-  sections: [
-    { date: '2026-09-15', entries: [entry('T-cease', 'new', { articleIds: ['c1'] })] },
-    { date: '2026-09-16', entries: [entry('T-cease', 'update', { articleIds: ['c1'] })] },
-  ],
+const STORY = {
+  stories: [written('T-cease', [part('2026-09-15')]), written('T-court', [part('2026-09-16')])],
+  ranking: ['T-cease', 'T-court'],
 };
 
-test('update or correction for a non-admitted thread is dropped', () => {
+test('update and correction are kept for a ranked thread with a written story', () => {
   const d = '2026-09-17';
-  const ev = evidenceFor(d);
   for (const kind of ['update', 'correction']) {
-    assert.equal(validateSection(reply([entry('T-court', kind, { articleIds: ['k2'] })]), WEEK, d, ev, EMPTY_STORY), null, kind);
+    const out = validateRanking(reply(['T-cease'], [], [update('T-cease', { kind, articleIds: ['c2'] })]), WEEK, d, evidenceFor(d, STORY), STORY);
+    assert.deepEqual(out.updates, [{ threadId: 'T-cease', part: { kind, paragraphs: ['Then more happened.'], articleIds: ['c2'], why: 'new facts' } }], kind);
   }
 });
 
-test('new for an admitted thread is dropped', () => {
+test('an update for an unranked, unwritten or unknown thread, or of an unknown kind, is dropped', () => {
   const d = '2026-09-17';
-  const ev = evidenceFor(d, ADMITTED_STORY);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { articleIds: ['c2'] })]), WEEK, d, ev, ADMITTED_STORY), null);
+  const ev = evidenceFor(d, STORY);
+  const drop = (ranking, u) => validateRanking(reply(ranking, [], [u]), WEEK, d, ev, STORY).updates;
+  assert.deepEqual(drop(['T-cease'], update('T-court', { articleIds: ['k2'] })), []);
+  assert.deepEqual(drop(['T-flood'], update('T-flood', { articleIds: ['f2'] })), []);
+  assert.deepEqual(drop(['T-cease'], update('T-made-up', { articleIds: ['c2'] })), []);
+  assert.deepEqual(drop(['T-cease'], update('T-cease', { kind: 'backstory', articleIds: ['c2'] })), []);
+  assert.deepEqual(drop(['T-cease'], update('T-cease', { kind: 'feature', articleIds: ['c2'] })), []);
 });
 
-test('update and correction for an admitted thread are kept', () => {
+test('at most one update per thread; the first valid one wins', () => {
   const d = '2026-09-17';
-  const ev = evidenceFor(d, ADMITTED_STORY);
-  for (const kind of ['update', 'correction']) {
-    const section = validateSection(reply([entry('T-cease', kind, { articleIds: ['c2'] })]), WEEK, d, ev, ADMITTED_STORY);
-    assert.equal(section.entries.length, 1, kind);
-    assert.equal(section.entries[0].kind, kind);
-  }
-});
-
-test('an unknown thread or kind is dropped', () => {
-  const d = '2026-09-17';
-  const ev = evidenceFor(d);
-  assert.equal(validateSection(reply([entry('T-made-up', 'new', { articleIds: ['c2'] })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(validateSection(reply([entry('T-cease', 'feature', { articleIds: ['c2'] })]), WEEK, d, ev, EMPTY_STORY), null);
-});
-
-test('a bad entry is dropped, never the whole section', () => {
-  const d = '2026-09-17';
-  const section = validateSection(
-    reply([
-      entry('T-rupee', 'new', { articleIds: ['r1'] }),
-      entry('T-cease', 'new', { articleIds: ['c2'] }),
-      entry('T-flood', 'update', { articleIds: ['f2'] }),
+  const out = validateRanking(
+    reply(['T-cease'], [], [
+      update('T-cease', { articleIds: ['nope'] }),
+      update('T-cease', { kind: 'correction', articleIds: ['c2'] }),
+      update('T-cease', { articleIds: ['c2'], paragraphs: ['Again.'] }),
     ]),
-    WEEK, d, evidenceFor(d), EMPTY_STORY
+    WEEK, d, evidenceFor(d, STORY), STORY
   );
-  assert.deepEqual(section.entries.map(e => e.threadId), ['T-cease']);
+  assert.deepEqual(out.updates.map(u => u.part.kind), ['correction']);
 });
 
-test('stored order is the model order, and a second entry for one thread is dropped', () => {
-  const d = '2026-09-17';
-  const section = validateSection(
-    reply([
-      entry('T-court', 'new', { articleIds: ['k2'], verification: 'official', basis: 'the Supreme Court ordered the ministry' }),
-      entry('T-cease', 'new', { articleIds: ['c2'] }),
-      entry('T-court', 'new', { articleIds: ['k1'], headline: 'Again' }),
-    ]),
-    WEEK, d, evidenceFor(d), EMPTY_STORY
-  );
-  assert.deepEqual(section.entries.map(e => e.threadId), ['T-court', 'T-cease']);
-  assert.deepEqual(section.entries[0].articleIds, ['k2']);
-});
-
-// ---- the validator: the grace window ----
-
-test('grace-window runs keep only new entries', () => {
+test('a grace-window run may rank and admit, but writes no update or correction', () => {
   const articles = [
     article('c1', 'T-cease', '2026-09-15', { sourcePosts: sources(2) }),
-    article('c2', 'T-cease', '2026-09-21'),
+    article('c2', 'T-cease', '2026-09-19'),
+    article('c3', 'T-cease', '2026-09-21'),
     article('f1', 'T-flood', '2026-09-18', { sourcePosts: sources(2) }),
     article('f2', 'T-flood', '2026-09-19'),
   ];
-  const story = { sections: [{ date: '2026-09-18', entries: [entry('T-flood', 'new', { articleIds: ['f1'] })] }] };
+  const story = { stories: [written('T-flood', [part('2026-09-18')])], ranking: ['T-flood'] };
   const d = '2026-09-21';
-  const ev = evidenceFor(d, story, articles);
-  const section = validateSection(
-    reply([
-      entry('T-flood', 'update', { articleIds: ['f2'] }),
-      entry('T-cease', 'new', { articleIds: ['c1', 'c2'] }),
-      entry('T-flood', 'correction', { articleIds: ['f2'] }),
+  const out = validateRanking(
+    reply(['T-cease', 'T-flood'], [backstory('T-cease', { articleIds: ['c1', 'c3'] })], [
+      update('T-flood', { articleIds: ['f2'] }),
+      update('T-flood', { kind: 'correction', articleIds: ['f2'] }),
     ]),
-    WEEK, d, ev, story
+    WEEK, d, evidenceFor(d, story, articles), story
   );
-  assert.deepEqual(section.entries.map(e => [e.threadId, e.kind]), [['T-cease', 'new']]);
-  // The grace edition made it lasting, but is not cited: it is after the period.
-  assert.deepEqual(section.entries[0].articleIds, ['c1']);
+  assert.deepEqual(out.ranking, ['T-cease', 'T-flood']);
+  assert.deepEqual(out.updates, []);
+  // The grace edition is evidence, but is not cited: it is after the period.
+  assert.deepEqual(out.backstories[0].part.articleIds, ['c1']);
 });
 
-// ---- the validator: article ids ----
+// ---- the validator: article ids and text ----
 
 test('article ids outside the thread, after d or outside the period are removed', () => {
   const articles = [
@@ -368,97 +429,67 @@ test('article ids outside the thread, after d or outside the period are removed'
     article('f1', 'T-flood', '2026-09-16'),
   ];
   const d = '2026-09-17';
-  const section = validateSection(
-    reply([entry('T-cease', 'new', { articleIds: ['f1', 'c3', 'before', 'nope', 'c2', 'c1', 'c2'] })]),
+  const out = validateRanking(
+    reply(['T-cease'], [backstory('T-cease', { articleIds: ['f1', 'c3', 'before', 'nope', 'c2', 'c1', 'c2'] })]),
     WEEK, d, evidenceFor(d, EMPTY_STORY, articles), EMPTY_STORY
   );
-  assert.deepEqual(section.entries[0].articleIds, ['c2', 'c1']);
+  assert.deepEqual(out.backstories[0].part.articleIds, ['c2', 'c1']);
 });
 
-test('an entry whose article ids are all removed is dropped', () => {
+test('a backstory or update whose article ids are all removed is dropped', () => {
   const d = '2026-09-17';
-  const ev = evidenceFor(d);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { articleIds: ['f1', 'r1'] })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { articleIds: [] })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { articleIds: 'c1' })]), WEEK, d, ev, EMPTY_STORY), null);
+  for (const ids of [['f1', 'r1'], [], 'c1']) {
+    const out = validateRanking(reply(['T-cease'], [backstory('T-cease', { articleIds: ids })]), WEEK, d, evidenceFor(d), EMPTY_STORY);
+    assert.deepEqual(out.ranking, [], JSON.stringify(ids));
+    const up = validateRanking(reply(['T-cease'], [], [update('T-cease', { articleIds: ids })]), WEEK, d, evidenceFor(d, STORY), STORY);
+    assert.deepEqual(up.updates, [], JSON.stringify(ids));
+  }
 });
 
-// ---- the validator: text ----
-
-test('no headline, or no non-empty paragraph, drops the entry', () => {
+test('no headline, or no non-empty paragraph, drops a backstory', () => {
   const d = '2026-09-17';
   const ev = evidenceFor(d);
-  const base = { articleIds: ['c2'] };
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { ...base, headline: '  ' })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { ...base, paragraphs: ['', '  ', 7] })]), WEEK, d, ev, EMPTY_STORY), null);
-  assert.equal(validateSection(reply([entry('T-cease', 'new', { ...base, paragraphs: 'It happened.' })]), WEEK, d, ev, EMPTY_STORY), null);
+  for (const extra of [{ headline: '  ' }, { paragraphs: ['', '  ', 7] }, { paragraphs: 'It happened.' }]) {
+    const out = validateRanking(reply(['T-cease'], [backstory('T-cease', { articleIds: ['c2'], ...extra })]), WEEK, d, ev, EMPTY_STORY);
+    assert.deepEqual(out.ranking, [], JSON.stringify(extra));
+  }
 });
 
 test('paragraphs are trimmed, emptied ones removed, and capped at four', () => {
   const d = '2026-09-17';
-  const section = validateSection(
-    reply([entry('T-cease', 'new', { articleIds: ['c2'], paragraphs: [' One. ', '', 'Two.', 'Three.', 'Four.', 'Five.'] })]),
+  const out = validateRanking(
+    reply(['T-cease'], [backstory('T-cease', { articleIds: ['c2'], paragraphs: [' One. ', '', 'Two.', 'Three.', 'Four.', 'Five.'] })]),
     WEEK, d, evidenceFor(d), EMPTY_STORY
   );
   assert.equal(MAX_PARAGRAPHS, 4);
-  assert.deepEqual(section.entries[0].paragraphs, ['One.', 'Two.', 'Three.', 'Four.']);
+  assert.deepEqual(out.backstories[0].part.paragraphs, ['One.', 'Two.', 'Three.', 'Four.']);
 });
 
-// ---- the validator: continuesFrom ----
-
-test('continuesFrom points at the thread\'s previous section date', () => {
-  const story = {
-    sections: [
-      { date: '2026-09-15', entries: [entry('T-cease', 'new', { articleIds: ['c1'] })] },
-      { date: '2026-09-16', entries: [entry('T-cease', 'update', { articleIds: ['c1'] }), entry('T-court', 'new')] },
-      { date: '2026-09-17', entries: [entry('T-court', 'update')] },
-    ],
-  };
-  const d = '2026-09-18';
-  const articles = [...ARTICLES, article('c3', 'T-cease', d), article('k3', 'T-court', d)];
-  const section = validateSection(
-    reply([
-      entry('T-cease', 'update', { articleIds: ['c3'] }),
-      entry('T-court', 'correction', { articleIds: ['k3'] }),
-    ]),
-    WEEK, d, evidenceFor(d, story, articles), story
-  );
-  assert.deepEqual(section.entries.map(e => [e.threadId, e.continuesFrom]), [
-    ['T-cease', '2026-09-16'],
-    ['T-court', '2026-09-17'],
-  ]);
-});
-
-test("a section already dated d is not the story so far, so today's section can be rewritten", () => {
+test("a story admitted by today's run is not written yet, so a re-run today writes its backstory again", () => {
   const d = '2026-09-17';
-  const story = { sections: [{ date: d, entries: [entry('T-cease', 'new', { articleIds: ['c2'] })] }] };
+  const story = { stories: [written('T-cease', [part(d)])], ranking: ['T-cease'] };
   const ev = evidenceFor(d, story);
-  assert.equal(ev.find(t => t.threadId === 'T-cease').admitted, false);
-  const section = validateSection(reply([entry('T-cease', 'new', { articleIds: ['c2'] })]), WEEK, d, ev, story);
-  assert.equal(section.entries[0].continuesFrom, null);
+  assert.equal(ev.find(t => t.threadId === 'T-cease').written, false);
+  const out = validateRanking(reply(['T-cease'], [backstory('T-cease', { articleIds: ['c2'] })]), WEEK, d, ev, story);
+  assert.equal(out.backstories.length, 1);
 });
 
 // ---- the validator: unusable replies ----
 
-test('an empty or unusable reply yields no section', () => {
+test('a reply with no ranking is unusable; an empty ranking is a normal answer', () => {
   const d = '2026-09-17';
   const ev = evidenceFor(d);
-  for (const bad of [null, undefined, '', 'no json here', '{"entries": "none"}', '{}', '[]', 42,
-    reply([]), reply([null, 'x', 3])]) {
-    assert.equal(validateSection(bad, WEEK, d, ev, EMPTY_STORY), null, String(bad));
+  for (const bad of [null, undefined, '', 'no json here', '{"ranking": "none"}', '{}', '[]', 42, '{"entries": []}']) {
+    assert.equal(validateRanking(bad, WEEK, d, ev, EMPTY_STORY), null, String(bad));
   }
+  assert.deepEqual(validateRanking('{"ranking": []}', WEEK, d, ev, EMPTY_STORY), { ranking: [], backstories: [], updates: [] });
+  assert.deepEqual(validateRanking(reply([null, 3, {}], [null, 'x'], [7]), WEEK, d, ev, EMPTY_STORY), { ranking: [], backstories: [], updates: [] });
 });
 
 test('a fenced reply, or an already parsed one, is accepted', () => {
   const d = '2026-09-17';
   const ev = evidenceFor(d);
-  const e = entry('T-cease', 'new', { articleIds: ['c2'] });
-  const fenced = '```json\n' + reply([e]) + '\n```';
-  assert.equal(validateSection(fenced, WEEK, d, ev, EMPTY_STORY).entries.length, 1);
-  assert.equal(validateSection({ entries: [e] }, WEEK, d, ev, EMPTY_STORY).entries.length, 1);
-});
-
-test('the code-enforced thresholds are the ones the ticket names', () => {
-  assert.equal(MIN_SOURCES, 2);
-  assert.equal(MIN_EDITIONS, 2);
+  const text = reply(['T-cease'], [backstory('T-cease', { articleIds: ['c2'] })]);
+  assert.deepEqual(validateRanking('```json\n' + text + '\n```', WEEK, d, ev, EMPTY_STORY).ranking, ['T-cease']);
+  assert.deepEqual(validateRanking(JSON.parse(text), WEEK, d, ev, EMPTY_STORY).ranking, ['T-cease']);
 });
