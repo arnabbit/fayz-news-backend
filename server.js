@@ -10,6 +10,7 @@ const { toFeedItem, toArticle, FEED_PROJECTION, toPeriod, storyArticleIds } = re
 const { pushTokenDocument, staleTokenCutoff } = require('./pushTokens');
 const { editionNotification } = require('./pushCopy');
 const { searchQuery, searchLimit } = require('./search');
+const { seenShortcodes } = require('./seenPosts');
 const { parsePeriodId, istDate } = require('./period');
 const { TEMPERATURE, MAX_TOKENS, REQUEST_TIMEOUT_MS, resolveModel } = require('./model');
 const { STORIES, catchUp, createStoryQueue, readStoryState } = require('./storyCatchUp');
@@ -23,8 +24,8 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.MONGODB_DB || 'fayznews';
 
-// One shared secret guards both writes. It lives in extension source, so it is
-// anti-drive-by rather than auth — stated plainly so nobody mistakes it for the
+// One shared secret guards the writes and the seen-posts read. It lives in
+// extension source, so it is anti-drive-by rather than auth — stated plainly so nobody mistakes it for the
 // latter. Rollout is two-phase: with REQUIRE_PUSH_KEY unset the endpoint accepts
 // an unauthenticated push and logs it, so shipping the backend can never stop
 // the pipeline; flip it to true once the extension sends the header.
@@ -214,15 +215,15 @@ async function editionRows(match, limit) {
   }));
 }
 
-// Registration is open and sending is behind the key (ticket 07), so this
-// guards writes only.
+// Registration is open and sending is behind the key (ticket 07). It guards the
+// writes and the one read that only the extension makes, the seen posts.
 function requireKey(req, res, next) {
   const provided = req.get('X-Chronicle-Key') || '';
   const ok = CHRONICLE_KEY !== '' && provided === CHRONICLE_KEY;
   if (ok) return next();
   if (!REQUIRE_PUSH_KEY) {
     console.warn(
-      `unauthenticated write accepted: ${req.method} ${req.originalUrl} ` +
+      `unauthenticated request accepted: ${req.method} ${req.originalUrl} ` +
       `(REQUIRE_PUSH_KEY is off${CHRONICLE_KEY === '' ? ', CHRONICLE_KEY is unset' : ''})`
     );
     return next();
@@ -893,6 +894,26 @@ app.get('/api/v2/periods/:id', async (req, res) => {
     if (articleCount > 0) queueStory(period);
   } catch (err) {
     console.error('GET /api/v2/periods/:id error:', err);
+    fail(res, 500, 'internal', err.message);
+  }
+});
+
+// ---- GET /api/v2/seen-posts — the upstream posts the paper already holds ----
+//
+// For the extension, which scans a profile's grid until it reaches posts it has
+// already filed. Derived from `articles.sourcePosts` on every request: there is
+// no second record to drift from the articles. Hidden articles count — their
+// posts were processed, and processing them again would refile the story.
+// Behind the key because hidden articles count: an open list would confirm a
+// hidden story existed. A post that held no news is never on an article, so it
+// is never seen here.
+app.get('/api/v2/seen-posts', requireKey, async (req, res) => {
+  try {
+    const urls = await db.collection('articles').distinct('sourcePosts.postUrl');
+    res.set('Cache-Control', 'no-store');
+    res.json({ shortcodes: seenShortcodes(urls) });
+  } catch (err) {
+    console.error('GET /api/v2/seen-posts error:', err);
     fail(res, 500, 'internal', err.message);
   }
 });
